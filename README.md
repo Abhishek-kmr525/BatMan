@@ -33,8 +33,8 @@ Open http://localhost:3000.
 
 Edit `.env` at the repo root. Key flags:
 
-- `KALSHI_DEMO=true` — runs against the built-in mock market generator (no Kalshi creds required). Set to `false` and fill `KALSHI_API_KEY` / `KALSHI_API_SECRET` once you have demo credentials.
-- `KNOWLEDGE_PDF_DIR` — path to your PDFs (defaults to `/Volumes/Personal/MetaTrade/Knowledge PDF`).
+- `KALSHI_DEMO=true` — runs against the built-in mock market generator (no Kalshi creds required). Set to `false` and fill Kalshi credentials.
+- `KNOWLEDGE_PDF_DIR` — path to your PDFs.
 - `MIN_TRADE_SCORE`, `MAX_CONCURRENT_POSITIONS`, `BOT_SCAN_INTERVAL_SECONDS` — agent tuning.
 
 ## API
@@ -48,6 +48,6 @@ See `backend/app/api/routes.py`. WebSocket at `ws://localhost:4000/api/ws` emits
 - ✅ Bot state machine (IDLE → SCANNING → ANALYZING → EXECUTING → MONITORING)
 - ✅ Trade executor ($1 buy, take-profit / stop-loss / time-exit)
 - ✅ Live dashboard (wallet, status, P&L chart, open + closed tables, log feed, start/stop, deposit)
-- 🔌 Kalshi: client implemented, currently in demo/mock mode (swap when creds arrive)
-- 🟡 Strategy Marketplace, Quick Trade — P1, deferred
-- 🟡 Deployment (Vercel + Railway) — local-only for now
+- 🔌 Kalshi client implemented (paper mode ready)
+- 🟡 Strategy Marketplace, Quick Trade — P1
+- 🟡 Deployment (Vercel + Railway)
