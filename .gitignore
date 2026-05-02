@@ -1,0 +1,25 @@
+.env
+.env.*
+!.env.example
+*.pyc
+__pycache__/
+.venv/
+venv/
+node_modules/
+.next/
+backend/data/*.db
+backend/data/chroma/
+.DS_Store
+
+# local secrets
+.env
+
+# local archives/artifacts
+*.zip
+manual-server-upload/
+
+# private keys
+backend/data/*.pem
+
+# private keys
+backend/data/*.pem

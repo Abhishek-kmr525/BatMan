@@ -1,0 +1,53 @@
+# AMTA — AI Master Trading Agent
+
+Autonomous Kalshi paper trading agent. $1 per trade, $10,000 starting balance, never real money.
+
+## Architecture (simplified 2-service stack)
+
+- **backend/** — Python FastAPI: Kalshi client, ChromaDB knowledge base, Claude analysis, bot loop, REST + WebSocket. SQLite for persistence.
+- **frontend/** — Next.js 14 dashboard with live updates over WebSocket.
+
+## Quick start
+
+```bash
+# 1. backend
+cd backend
+./run.sh                    # creates .venv, installs deps, runs on :4000
+
+# 2. frontend (new terminal)
+cd frontend
+npm install
+npm run dev                 # runs on :3000
+```
+
+Open http://localhost:3000.
+
+## First-run flow
+
+1. Backend boots → creates `data/amta.db`, seeds wallet at $10,000.
+2. From the dashboard, click **Reload PDFs** to ingest the knowledge base (one-time, takes a few minutes).
+3. Click **▶ Start Bot**. The bot scans markets every 30s, asks Claude to score them against the PDF knowledge, and opens $1 positions on any market scoring ≥ 65.
+4. Open positions appear live; trades close on take-profit / stop-loss / time-exit. Wallet updates each tick.
+
+## Configuration
+
+Edit `.env` at the repo root. Key flags:
+
+- `KALSHI_DEMO=true` — runs against the built-in mock market generator (no Kalshi creds required). Set to `false` and fill `KALSHI_API_KEY` / `KALSHI_API_SECRET` once you have demo credentials.
+- `KNOWLEDGE_PDF_DIR` — path to your PDFs (defaults to `/Volumes/Personal/MetaTrade/Knowledge PDF`).
+- `MIN_TRADE_SCORE`, `MAX_CONCURRENT_POSITIONS`, `BOT_SCAN_INTERVAL_SECONDS` — agent tuning.
+
+## API
+
+See `backend/app/api/routes.py`. WebSocket at `ws://localhost:4000/api/ws` emits `bot:status`, `trade:opened`, `trade:closed`, `wallet:updated`, `agent:log`, `market:scan`.
+
+## Status vs spec (files/01-09)
+
+- ✅ AI agent (RAG + Claude scoring)
+- ✅ Paper wallet ($10k seed, deposit, P&L, win rate)
+- ✅ Bot state machine (IDLE → SCANNING → ANALYZING → EXECUTING → MONITORING)
+- ✅ Trade executor ($1 buy, take-profit / stop-loss / time-exit)
+- ✅ Live dashboard (wallet, status, P&L chart, open + closed tables, log feed, start/stop, deposit)
+- 🔌 Kalshi: client implemented, currently in demo/mock mode (swap when creds arrive)
+- 🟡 Strategy Marketplace, Quick Trade — P1, deferred
+- 🟡 Deployment (Vercel + Railway) — local-only for now

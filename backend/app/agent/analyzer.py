@@ -1,0 +1,723 @@
+"""Analysis Engine — free local multi-skill scoring with optional Claude."""
+from __future__ import annotations
+
+import json
+from datetime import date
+from dataclasses import dataclass
+
+import httpx
+from anthropic import (
+    APIConnectionError,
+    APIStatusError,
+    Anthropic,
+    AuthenticationError,
+    BadRequestError,
+    RateLimitError,
+)
+
+from app.agent import knowledge
+from app.core.config import settings
+from app.services.kalshi import Market
+
+_client: Anthropic | None = None
+_gemini_usage_day: str | None = None
+_gemini_usage_count = 0
+
+
+def _claude() -> Anthropic:
+    global _client
+    if not settings.ANTHROPIC_API_KEY:
+        raise RuntimeError("missing ANTHROPIC_API_KEY")
+    if _client is None:
+        _client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    return _client
+
+
+SYSTEM_PROMPT = """You are AMTA, an AI Master Trading Agent for Kalshi event contracts.
+You analyze a single market using expert trading knowledge from the provided context.
+You always respond in strict JSON only — no prose, no markdown.
+
+Trade rules:
+- Position size is fixed at $1.00 per trade. Do not propose larger sizes.
+- Only recommend a trade if score >= 65/100.
+- Score weights: PDF strategy match 35, probability edge 25, time value 20, liquidity 10, clarity 10.
+- target_exit_price and stop_loss_price are in 0..1 (probability), on the same side as your action.
+- action must be one of: BUY_YES, BUY_NO, SKIP.
+
+Output schema:
+{
+  "score": int 0-100,
+  "action": "BUY_YES" | "BUY_NO" | "SKIP",
+  "confidence": float 0..1,
+  "entry_price": float 0..1,
+  "target_exit_price": float 0..1,
+  "stop_loss_price": float 0..1,
+  "reasoning": str (<=240 chars),
+  "knowledge_sources": [str]
+}
+"""
+
+
+@dataclass
+class Analysis:
+    score: int
+    action: str
+    confidence: float
+    entry_price: float
+    target_exit_price: float
+    stop_loss_price: float
+    reasoning: str
+    knowledge_sources: list[str]
+    raw: dict
+
+
+def _build_user_prompt(market: Market, chunks: list[dict]) -> str:
+    ctx_blocks = []
+    for c in chunks:
+        meta = c.get("metadata") or {}
+        src = f"{meta.get('file_name','?')} p.{meta.get('page','?')}"
+        ctx_blocks.append(f"[{src}] {c['text'][:800]}")
+    ctx = "\n\n".join(ctx_blocks) if ctx_blocks else "(no PDF context available)"
+    market_json = json.dumps(
+        {
+            "ticker": market.ticker,
+            "title": market.title,
+            "category": market.category,
+            "yes_price": market.yes_price,
+            "no_price": market.no_price,
+            "volume": market.volume,
+            "open_interest": market.open_interest,
+            "time_to_close_seconds": market.close_time_seconds,
+        },
+        indent=2,
+    )
+    return (
+        f"KNOWLEDGE BASE CONTEXT:\n{ctx}\n\n"
+        f"MARKET:\n{market_json}\n\n"
+        "Return JSON only."
+    )
+
+
+async def analyze_market(market: Market) -> Analysis:
+    rag_query = f"Kalshi {market.category} market: {market.title}"
+
+    if settings.ANALYZER_PROVIDER.lower() != "claude":
+        chunks = _safe_local_context(rag_query) if settings.LOCAL_ANALYZER_USE_RAG else []
+        data = _local_skill_score(market, chunks)
+        data = _maybe_apply_gemini_review(market, data)
+        sources = data.get("knowledge_sources") or [
+            f"{(c['metadata'] or {}).get('file_name','?')} p.{(c['metadata'] or {}).get('page','?')}"
+            for c in chunks
+        ]
+        return _analysis_from_data(market, data, sources)
+
+    chunks = knowledge.query(rag_query, k=5)
+    try:
+        msg = _claude().messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=600,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": _build_user_prompt(market, chunks)}],
+        )
+        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
+        text = _strip_code_fence(text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = _heuristic_score(market, reason="claude returned non-JSON")
+    except Exception as e:
+        # API failure (credits, network, rate limits) — fall back to heuristic
+        # so the bot can demo end-to-end. Real Claude scoring resumes automatically.
+        data = _heuristic_score(market, reason=_claude_error_reason(e))
+    sources = data.get("knowledge_sources") or [
+        f"{(c['metadata'] or {}).get('file_name','?')} p.{(c['metadata'] or {}).get('page','?')}"
+        for c in chunks
+    ]
+    return _analysis_from_data(market, data, sources)
+
+
+def _analysis_from_data(market: Market, data: dict, sources: list[str]) -> Analysis:
+    return Analysis(
+        score=int(data.get("score", 0)),
+        action=str(data.get("action", "SKIP")).upper(),
+        confidence=float(data.get("confidence", 0.0)),
+        entry_price=float(data.get("entry_price", market.yes_price)),
+        target_exit_price=float(data.get("target_exit_price", market.yes_price)),
+        stop_loss_price=float(data.get("stop_loss_price", market.yes_price)),
+        reasoning=str(data.get("reasoning", ""))[:300],
+        knowledge_sources=list(sources),
+        raw=data,
+    )
+
+
+def _local_skill_score(market: Market, chunks: list[dict]) -> dict:
+    """Free analyzer assembled from small deterministic trading skills."""
+    side_signal = _skill_side_and_edge(market)
+    liquidity = _skill_liquidity(market)
+    time_signal = _skill_time(market)
+    clarity = _skill_clarity(market)
+    knowledge_signal = _skill_knowledge_match(market, chunks)
+
+    entry = side_signal["entry"]
+    score_raw = (
+        18
+        + side_signal["score"] * 0.34
+        + liquidity["score"] * 0.18
+        + time_signal["score"] * 0.16
+        + clarity["score"] * 0.12
+        + knowledge_signal["score"] * 0.20
+    )
+    score = int(round(_clamp(score_raw, 0.0, 99.0)))
+
+    target, stop, tp_move, sl_move = _risk_prices(
+        entry=entry,
+        edge_norm=side_signal["edge_norm"],
+        liquidity_norm=liquidity["norm"],
+        time_quality=time_signal["quality"],
+        close_seconds=market.close_time_seconds,
+    )
+
+    confidence = round(
+        _clamp(
+            0.12
+            + side_signal["edge_norm"] * 0.36
+            + liquidity["norm"] * 0.18
+            + time_signal["quality"] * 0.18
+            + clarity["norm"] * 0.08
+            + knowledge_signal["norm"] * 0.08,
+            0.05,
+            0.95,
+        ),
+        2,
+    )
+
+    tradable = (
+        score >= settings.MIN_TRADE_SCORE
+        and side_signal["edge"] >= 0.06
+        and entry >= settings.MIN_ENTRY_PRICE
+        and market.volume >= 25
+        and market.close_time_seconds >= 8 * 60
+        and clarity["norm"] >= 0.35
+    )
+
+    reason_parts = [
+        f"free local skills",
+        f"{side_signal['side']} @ {entry:.2f}",
+        f"edge {side_signal['edge']:.2f}",
+        f"liq {liquidity['norm']:.2f}",
+        f"time {time_signal['label']}",
+        f"kb {knowledge_signal['label']}",
+        f"target {target:.2f} (+{tp_move:.2f})",
+        f"stop {stop:.2f} (-{sl_move:.2f})",
+    ]
+
+    return {
+        "score": score,
+        "action": f"BUY_{side_signal['side']}" if tradable else "SKIP",
+        "confidence": confidence,
+        "entry_price": entry,
+        "target_exit_price": target,
+        "stop_loss_price": stop,
+        "reasoning": "; ".join(reason_parts),
+        "knowledge_sources": knowledge_signal["sources"],
+        "skills": {
+            "probability_edge": side_signal,
+            "liquidity": liquidity,
+            "time": time_signal,
+            "market_clarity": clarity,
+            "knowledge_match": knowledge_signal,
+        },
+        "provider": "local",
+    }
+
+
+def _maybe_apply_gemini_review(market: Market, data: dict) -> dict:
+    if not settings.GEMINI_REVIEW_ENABLED:
+        data["ai_review"] = {"provider": "gemini", "status": "disabled"}
+        return data
+    if int(data.get("score", 0)) < settings.GEMINI_REVIEW_MIN_SCORE:
+        data["ai_review"] = {
+            "provider": "gemini",
+            "status": "skipped_low_score",
+            "min_score": settings.GEMINI_REVIEW_MIN_SCORE,
+        }
+        return data
+    if not _gemini_quota_available():
+        data["ai_review"] = {
+            "provider": "gemini",
+            "status": "skipped_daily_limit",
+            "daily_limit": settings.GEMINI_DAILY_LIMIT,
+        }
+        return data
+    review = _gemini_review(market, data)
+    data["ai_review"] = review
+    if review.get("decision") == "REJECT":
+        data["action"] = "SKIP"
+        data["reasoning"] = f"{data['reasoning']}; gemini rejected: {review.get('reason', '')}"[:300]
+    elif review.get("decision") == "CAUTION":
+        data["confidence"] = round(max(0.05, float(data.get("confidence", 0.0)) - 0.08), 2)
+        data["reasoning"] = f"{data['reasoning']}; gemini caution: {review.get('reason', '')}"[:300]
+    elif review.get("decision") == "APPROVE":
+        data["reasoning"] = f"{data['reasoning']}; gemini approved"[:300]
+    return data
+
+
+def _gemini_quota_available() -> bool:
+    global _gemini_usage_day, _gemini_usage_count
+    today = date.today().isoformat()
+    if _gemini_usage_day != today:
+        _gemini_usage_day = today
+        _gemini_usage_count = 0
+    return _gemini_usage_count < settings.GEMINI_DAILY_LIMIT
+
+
+def _gemini_mark_used() -> None:
+    global _gemini_usage_count
+    _gemini_usage_count += 1
+
+
+def _gemini_review(market: Market, data: dict) -> dict:
+    if not settings.GEMINI_API_KEY:
+        return {"provider": "gemini", "status": "missing_key"}
+    prompt = {
+        "task": (
+            "Review this Kalshi trade signal. Return only a compact JSON object "
+            "with decision and reason. No preamble."
+        ),
+        "allowed_schema": {
+            "decision": "APPROVE | CAUTION | REJECT",
+            "reason": "short reason under 120 chars",
+        },
+        "rules": [
+            "Do not create a new trade idea.",
+            "Reject if the trade relies only on cheap price without a clear event edge.",
+            "Use CAUTION for correlated, unclear, long-dated, or thin markets.",
+            "APPROVE only if the local signal is reasonable for paper-trading review.",
+        ],
+        "market": {
+            "ticker": market.ticker,
+            "title": market.title,
+            "category": market.category,
+            "yes_price": market.yes_price,
+            "no_price": market.no_price,
+            "volume": market.volume,
+            "open_interest": market.open_interest,
+            "time_to_close_seconds": market.close_time_seconds,
+        },
+        "local_signal": {
+            "score": data.get("score"),
+            "action": data.get("action"),
+            "confidence": data.get("confidence"),
+            "entry_price": data.get("entry_price"),
+            "target_exit_price": data.get("target_exit_price"),
+            "stop_loss_price": data.get("stop_loss_price"),
+            "reasoning": data.get("reasoning"),
+        },
+    }
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{settings.GEMINI_MODEL}:generateContent"
+    )
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            resp = client.post(
+                url,
+                params={"key": settings.GEMINI_API_KEY},
+                json={
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [{"text": json.dumps(prompt)}],
+                        }
+                    ],
+                    "generationConfig": {
+                        "temperature": 0.1,
+                        "maxOutputTokens": 512,
+                        "responseMimeType": "application/json",
+                        "thinkingConfig": {"thinkingBudget": 0},
+                    },
+                },
+            )
+        _gemini_mark_used()
+        if resp.status_code >= 400:
+            return {
+                "provider": "gemini",
+                "status": "error",
+                "error": _gemini_error_message(resp),
+            }
+        payload = resp.json()
+        text = _gemini_text(payload)
+        parsed = _parse_review_json(text)
+        decision = str(parsed.get("decision", "CAUTION")).upper()
+        if decision not in {"APPROVE", "CAUTION", "REJECT"}:
+            decision = "CAUTION"
+        return {
+            "provider": "gemini",
+            "status": "reviewed",
+            "model": settings.GEMINI_MODEL,
+            "decision": decision,
+            "reason": str(parsed.get("reason", ""))[:160],
+        }
+    except Exception as exc:
+        return {
+            "provider": "gemini",
+            "status": "error",
+            "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }
+
+
+def _parse_review_json(text: str) -> dict:
+    cleaned = _strip_code_fence(text).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(cleaned[start : end + 1])
+        raise
+
+
+def _gemini_text(payload: dict) -> str:
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        return "{}"
+    parts = ((candidates[0].get("content") or {}).get("parts") or [])
+    return "".join(str(p.get("text", "")) for p in parts).strip() or "{}"
+
+
+def _gemini_error_message(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+        err = body.get("error") or {}
+        return str(err.get("message") or body)[:180]
+    except Exception:
+        return resp.text[:180]
+
+
+def check_gemini_health() -> dict:
+    if not settings.GEMINI_REVIEW_ENABLED:
+        return {
+            "ok": False,
+            "enabled": False,
+            "provider": "gemini",
+            "model": settings.GEMINI_MODEL,
+            "error": "gemini review disabled",
+        }
+    if not settings.GEMINI_API_KEY:
+        return {
+            "ok": False,
+            "enabled": True,
+            "provider": "gemini",
+            "model": settings.GEMINI_MODEL,
+            "error": "missing GEMINI_API_KEY",
+        }
+    review = _gemini_review(
+        Market("HEALTH", "Will this health check return OK?", "System", 0.5, 0.5, 100, 100, 3600, {}),
+        {"score": 99, "action": "SKIP", "confidence": 0.0, "reasoning": "health check"},
+    )
+    return {
+        "ok": review.get("status") == "reviewed",
+        "enabled": True,
+        "provider": "gemini",
+        "model": settings.GEMINI_MODEL,
+        "daily_limit": settings.GEMINI_DAILY_LIMIT,
+        "used_today": _gemini_usage_count,
+        "review": review,
+    }
+
+
+def _safe_local_context(query: str) -> list[dict]:
+    """Optional RAG context for local mode; never let retrieval block trading."""
+    try:
+        return knowledge.query(query, k=5)
+    except Exception:
+        return []
+
+
+def _heuristic_score(market: Market, reason: str = "heuristic") -> dict:
+    """Fallback model when Claude is unavailable.
+
+    Uses market structure signals (edge, liquidity, time-to-close) to:
+    - choose side (cheaper contract),
+    - compute dynamic take-profit / stop-loss distances,
+    - gate weak setups to SKIP instead of forcing low-quality entries.
+    """
+    yes = market.yes_price
+    side = "YES" if yes <= 0.5 else "NO"
+    entry = yes if side == "YES" else market.no_price
+    edge = max(0.0, 0.5 - entry)  # 0..0.5; larger means cheaper, more asymmetric
+    edge_norm = _clamp(edge / 0.35, 0.0, 1.0)
+
+    vol_norm = _clamp(market.volume / 5_000.0, 0.0, 1.0)
+    oi_norm = _clamp(market.open_interest / 2_000.0, 0.0, 1.0)
+    liquidity = 0.75 * vol_norm + 0.25 * oi_norm
+    time_quality = _time_quality(market.close_time_seconds)
+
+    # Penalize markets near 50/50 where the fallback has little true edge.
+    mid_penalty = _clamp((0.10 - edge) / 0.10, 0.0, 1.0)
+
+    score_raw = 44 + edge_norm * 32 + liquidity * 14 + time_quality * 10 - mid_penalty * 18
+    score = int(round(_clamp(score_raw, 0.0, 99.0)))
+
+    # Dynamic exits: wider when structure is stronger / more time available,
+    # tighter when close to expiry.
+    base_move = 0.02 + edge_norm * 0.07 + liquidity * 0.04
+    tp_mult = _tp_time_multiplier(market.close_time_seconds)
+    tp_move = round(_clamp(base_move * tp_mult, 0.02, 0.20), 2)
+
+    # Maintain asymmetric reward/risk while capping for tiny entries.
+    rr_to_stop = 0.58 + (1.0 - liquidity) * 0.15 + (1.0 - time_quality) * 0.12
+    stop_cap = max(0.01, min(0.15, round(entry - 0.01, 2)))
+    sl_move = round(_clamp(tp_move * rr_to_stop, 0.01, stop_cap), 2)
+
+    target = round(_clamp(entry + tp_move, 0.01, 0.97), 2)
+    stop = round(_clamp(entry - sl_move, 0.01, 0.96), 2)
+    if stop >= entry:
+        stop = round(max(0.01, entry - 0.01), 2)
+
+    confidence_raw = (
+        0.20 + edge_norm * 0.45 + liquidity * 0.20 + time_quality * 0.15 - mid_penalty * 0.20
+    )
+    confidence = round(_clamp(confidence_raw, 0.05, 0.95), 2)
+
+    tradable = (
+        score >= 65
+        and edge >= 0.06
+        and entry >= settings.MIN_ENTRY_PRICE
+        and market.volume >= 25
+        and market.close_time_seconds >= 8 * 60
+    )
+
+    return {
+        "score": score,
+        "action": f"BUY_{side}" if tradable else "SKIP",
+        "confidence": confidence,
+        "entry_price": entry,
+        "target_exit_price": target,
+        "stop_loss_price": stop,
+        "reasoning": (
+            f"{reason}; {side} @ {entry:.2f}, "
+            f"score={score}, liq={liquidity:.2f}, t={market.close_time_seconds}s, "
+            f"target {target:.2f} (+{tp_move:.2f}), stop {stop:.2f} (-{sl_move:.2f})"
+        ),
+        "knowledge_sources": [],
+    }
+
+
+def _skill_side_and_edge(market: Market) -> dict:
+    yes = market.yes_price
+    no = market.no_price
+    side = "YES" if yes <= no else "NO"
+    entry = yes if side == "YES" else no
+    edge = max(0.0, 0.5 - entry)
+    edge_norm = _clamp(edge / 0.35, 0.0, 1.0)
+    mid_penalty = _clamp((0.10 - edge) / 0.10, 0.0, 1.0)
+    return {
+        "side": side,
+        "entry": entry,
+        "edge": edge,
+        "edge_norm": edge_norm,
+        "score": _clamp(edge_norm * 100 - mid_penalty * 35, 0.0, 100.0),
+    }
+
+
+def _skill_liquidity(market: Market) -> dict:
+    vol_norm = _clamp(market.volume / 5_000.0, 0.0, 1.0)
+    oi_norm = _clamp(market.open_interest / 2_000.0, 0.0, 1.0)
+    norm = 0.75 * vol_norm + 0.25 * oi_norm
+    return {"norm": norm, "score": norm * 100, "volume": market.volume}
+
+
+def _skill_time(market: Market) -> dict:
+    quality = _time_quality(market.close_time_seconds)
+    if market.close_time_seconds < 15 * 60:
+        label = "too close"
+    elif market.close_time_seconds < 60 * 60:
+        label = "near expiry"
+    elif market.close_time_seconds < 6 * 60 * 60:
+        label = "active window"
+    elif market.close_time_seconds < 24 * 60 * 60:
+        label = "same day"
+    else:
+        label = "longer dated"
+    return {"quality": quality, "score": quality * 100, "label": label}
+
+
+def _skill_clarity(market: Market) -> dict:
+    title = (market.title or "").strip()
+    has_question = "?" in title or title.lower().startswith(("will ", "who ", "what "))
+    has_binary_words = any(w in title.lower() for w in ("above", "below", "win", "close", "reach"))
+    length_score = 1.0 if 12 <= len(title) <= 180 else 0.55
+    norm = _clamp((0.45 if has_question else 0.2) + (0.35 if has_binary_words else 0.1) + length_score * 0.2, 0.0, 1.0)
+    return {"norm": norm, "score": norm * 100}
+
+
+def _skill_knowledge_match(market: Market, chunks: list[dict]) -> dict:
+    if not chunks:
+        return {"norm": 0.2, "score": 20.0, "label": "no pdf match", "sources": []}
+
+    market_terms = _terms(f"{market.category} {market.title}")
+    best = 0.0
+    sources: list[str] = []
+    for chunk in chunks[:5]:
+        text = str(chunk.get("text") or "")
+        overlap = len(market_terms & _terms(text))
+        score = _clamp(overlap / 8.0, 0.0, 1.0)
+        if score > best:
+            best = score
+        meta = chunk.get("metadata") or {}
+        src = f"{meta.get('file_name','?')} p.{meta.get('page','?')}"
+        if src not in sources:
+            sources.append(src)
+
+    if best >= 0.7:
+        label = "strong pdf match"
+    elif best >= 0.35:
+        label = "partial pdf match"
+    else:
+        label = "weak pdf match"
+    return {"norm": best, "score": best * 100, "label": label, "sources": sources}
+
+
+def _terms(text: str) -> set[str]:
+    cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
+    stop = {
+        "the", "and", "for", "with", "will", "this", "that", "from", "market",
+        "kalshi", "contract", "contracts", "yes", "no", "above", "below",
+    }
+    return {w for w in cleaned.split() if len(w) >= 4 and w not in stop}
+
+
+def _risk_prices(
+    *,
+    entry: float,
+    edge_norm: float,
+    liquidity_norm: float,
+    time_quality: float,
+    close_seconds: int,
+) -> tuple[float, float, float, float]:
+    base_move = 0.02 + edge_norm * 0.07 + liquidity_norm * 0.04
+    tp_mult = _tp_time_multiplier(close_seconds)
+    tp_move = round(_clamp(base_move * tp_mult, 0.02, 0.20), 2)
+    rr_to_stop = 0.58 + (1.0 - liquidity_norm) * 0.15 + (1.0 - time_quality) * 0.12
+    stop_cap = max(0.01, min(0.15, round(entry - 0.01, 2)))
+    sl_move = round(_clamp(tp_move * rr_to_stop, 0.01, stop_cap), 2)
+    target = round(_clamp(entry + tp_move, 0.01, 0.97), 2)
+    stop = round(_clamp(entry - sl_move, 0.01, 0.96), 2)
+    if stop >= entry:
+        stop = round(max(0.01, entry - 0.01), 2)
+        sl_move = round(entry - stop, 2)
+    return target, stop, tp_move, sl_move
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _time_quality(close_seconds: int) -> float:
+    """How favorable the remaining time is for fallback trades."""
+    if close_seconds < 15 * 60:
+        return 0.15
+    if close_seconds < 60 * 60:
+        return 0.55
+    if close_seconds < 6 * 60 * 60:
+        return 1.0
+    if close_seconds < 24 * 60 * 60:
+        return 0.75
+    return 0.55
+
+
+def _tp_time_multiplier(close_seconds: int) -> float:
+    if close_seconds < 60 * 60:
+        return 0.75
+    if close_seconds < 6 * 60 * 60:
+        return 1.0
+    if close_seconds < 24 * 60 * 60:
+        return 1.15
+    return 1.25
+
+
+def _strip_code_fence(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[1] if "\n" in s else s[3:]
+        if s.endswith("```"):
+            s = s[: -3]
+    return s.strip()
+
+
+def _claude_error_reason(exc: Exception) -> str:
+    """Return a safe, actionable fallback reason without exposing secrets."""
+    if isinstance(exc, AuthenticationError):
+        return "claude unavailable: authentication failed; replace ANTHROPIC_API_KEY"
+    if isinstance(exc, BadRequestError):
+        return f"claude unavailable: bad request; {_api_error_message(exc)}"
+    if isinstance(exc, RateLimitError):
+        return "claude unavailable: rate limited"
+    if isinstance(exc, APIConnectionError):
+        return "claude unavailable: connection error"
+    if isinstance(exc, APIStatusError):
+        return f"claude unavailable: API status {exc.status_code}; {_api_error_message(exc)}"
+    if isinstance(exc, RuntimeError) and "ANTHROPIC_API_KEY" in str(exc):
+        return "claude unavailable: missing ANTHROPIC_API_KEY"
+    return f"claude unavailable: {type(exc).__name__}"
+
+
+def _api_error_message(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    message = ""
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            message = str(err.get("message") or "")
+        else:
+            message = str(body.get("message") or "")
+    if not message:
+        message = str(exc)
+    # Keep database/UI text compact and avoid carrying request IDs or long payloads.
+    return message.replace("\n", " ")[:180]
+
+
+def check_claude_health() -> dict:
+    """Small synchronous preflight used by the API health endpoint."""
+    if settings.ANALYZER_PROVIDER.lower() != "claude":
+        return {
+            "ok": False,
+            "enabled": False,
+            "provider": settings.ANALYZER_PROVIDER,
+            "model": settings.CLAUDE_MODEL,
+            "error": "claude disabled; ANALYZER_PROVIDER=local prevents paid API calls",
+        }
+    if not settings.ANTHROPIC_API_KEY:
+        return {
+            "ok": False,
+            "enabled": True,
+            "provider": settings.ANALYZER_PROVIDER,
+            "model": settings.CLAUDE_MODEL,
+            "error": "missing ANTHROPIC_API_KEY",
+        }
+    try:
+        msg = _claude().messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=16,
+            messages=[{"role": "user", "content": "Return OK only."}],
+        )
+        text = "".join(
+            b.text for b in msg.content if getattr(b, "type", "") == "text"
+        ).strip()
+        return {
+            "ok": True,
+            "enabled": True,
+            "provider": settings.ANALYZER_PROVIDER,
+            "model": settings.CLAUDE_MODEL,
+            "response": text[:32],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "enabled": True,
+            "provider": settings.ANALYZER_PROVIDER,
+            "model": settings.CLAUDE_MODEL,
+            "error": _claude_error_reason(exc),
+        }

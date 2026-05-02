@@ -1,0 +1,16 @@
+Kalshi Study PDF Pack Manifest
+Generated on 2026-04-27
+
+00_START_HERE_Kalshi_Study_Roadmap.pdf | pages: 1 | size: 0.00 MB
+01_Kalshi_official/Kalshi_Klear_rulebook_v1_3.pdf | pages: 81 | size: 0.89 MB
+01_Kalshi_official/Kalshi_Klear_self_clearing_member_agreement.pdf | pages: 9 | size: 0.19 MB
+01_Kalshi_official/Kalshi_developer_agreement.pdf | pages: 6 | size: 0.12 MB
+01_Kalshi_official/Kalshi_fee_schedule.pdf | pages: 7 | size: 0.21 MB
+01_Kalshi_official/Kalshi_member_agreement.pdf | pages: 9 | size: 0.19 MB
+01_Kalshi_official/Kalshi_privacy_policy.pdf | pages: 7 | size: 0.15 MB
+01_Kalshi_official/Kalshi_rulebook_v1_24.pdf | pages: 83 | size: 1.23 MB
+02_Prediction_markets_and_regulation/CFTC_prediction_markets_fact_sheet_2026.pdf | pages: 1 | size: 0.09 MB
+03_Probability_statistics_forecasting/Grinstead_Snell_Introduction_to_Probability_GNU_FDL.pdf | pages: 518 | size: 2.85 MB
+03_Probability_statistics_forecasting/OpenIntro_Statistics_4th_Edition_CC_BY_SA.pdf | pages: 422 | size: 19.86 MB
+04_Macro_and_data_sources/BEA_NIPA_Handbook_all_chapters_2024.pdf | pages: 481 | size: 6.11 MB
+04_Macro_and_data_sources/BLS_CPI_Handbook_of_Methods_2018.pdf | pages: 107 | size: 1.89 MB
