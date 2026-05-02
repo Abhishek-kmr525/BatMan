@@ -12,6 +12,13 @@ type BotStatus = {
   active_positions?: number;
   max_concurrent_positions?: number;
 };
+type TradeSummary = {
+  total_count: number;
+  open_count: number;
+  closed_count: number;
+  today_opened_count: number;
+  today_closed_count: number;
+};
 type Trade = {
   id: string; market_id: string; market_title: string; category: string;
   direction: "YES" | "NO"; amount: number; entry_price: number;
@@ -55,6 +62,7 @@ export default function Dashboard() {
   const [closed, setClosed] = useState<Trade[]>([]);
   const [allTrades, setAllTrades] = useState<Trade[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [summary, setSummary] = useState<TradeSummary | null>(null);
   const [pnlSeries, setPnl] = useState<{ t: string; pnl: number }[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -62,12 +70,13 @@ export default function Dashboard() {
 
   async function refresh() {
     try {
-      const [w, b, o, c, l] = await Promise.all([
+      const [w, b, o, c, l, s] = await Promise.all([
         api<Wallet>("/wallet"),
         api<BotStatus>("/bot/status"),
         api<Trade[]>("/trades?status=open&limit=50"),
         api<Trade[]>("/trades?status=closed&limit=50"),
         api<LogEntry[]>("/agent/logs?limit=50"),
+        api<TradeSummary>("/trades/summary"),
       ]);
       const all = await api<Trade[]>("/trades?status=all&limit=500&page=1");
       setWallet(w);
@@ -76,6 +85,7 @@ export default function Dashboard() {
       setClosed(c);
       setAllTrades(all);
       setLogs(l);
+      setSummary(s);
       setError(null);
 
       // build cumulative P&L vs time from closed trades (oldest -> newest)
@@ -288,7 +298,7 @@ export default function Dashboard() {
           </div>
           <div className="dashx-account-row">
             <span>Today</span>
-            <strong>{bot?.trades_today ?? 0} trades</strong>
+            <strong>{summary?.today_opened_count ?? bot?.trades_today ?? 0} opened</strong>
           </div>
         </div>
       </div>
@@ -329,7 +339,7 @@ export default function Dashboard() {
         <div className="card dashx-side">
           <div className="dashx-side-tabs">
             <span>Closed</span>
-            <span className="sub">Open: {open.length}</span>
+            <span className="sub">Open: {summary?.open_count ?? open.length}</span>
           </div>
           <div className="dashx-side-list">
             {rightList.length === 0 && <div className="sub">No recent closed trades.</div>}

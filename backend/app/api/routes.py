@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
-from sqlalchemy import delete, desc, select
+from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent import knowledge
@@ -147,6 +148,34 @@ async def trades_list(
             out.append(d)
         return out
     return [_trade_dict(t) for t in rows]
+
+
+@router.get("/trades/summary")
+async def trades_summary(session: AsyncSession = Depends(get_session)):
+    now = datetime.now(timezone.utc)
+    start_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+
+    total_q = select(func.count(Trade.id))
+    open_q = select(func.count(Trade.id)).where(Trade.status == "OPEN")
+    closed_q = select(func.count(Trade.id)).where(Trade.status.like("CLOSED%"))
+    today_open_q = select(func.count(Trade.id)).where(Trade.opened_at >= start_utc)
+    today_closed_q = select(func.count(Trade.id)).where(
+        Trade.closed_at.is_not(None), Trade.closed_at >= start_utc
+    )
+
+    total = int((await session.execute(total_q)).scalar_one() or 0)
+    open_count = int((await session.execute(open_q)).scalar_one() or 0)
+    closed_count = int((await session.execute(closed_q)).scalar_one() or 0)
+    today_opened = int((await session.execute(today_open_q)).scalar_one() or 0)
+    today_closed = int((await session.execute(today_closed_q)).scalar_one() or 0)
+
+    return {
+        "total_count": total,
+        "open_count": open_count,
+        "closed_count": closed_count,
+        "today_opened_count": today_opened,
+        "today_closed_count": today_closed,
+    }
 
 
 @router.get("/trades/{trade_id}")
