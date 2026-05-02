@@ -305,7 +305,7 @@ export default function Dashboard() {
 
       <div className="dashx-grid-mid">
         <div className="dashx-main">
-          <div className="card dashx-chart-card">
+          <div className="card dashx-chart-card dashx-chart-wide">
             <h3>Account Balance</h3>
             <div className="dashx-chart-wrap">
               <ResponsiveContainer width="100%" height="100%">
@@ -316,21 +316,6 @@ export default function Dashboard() {
                   <Tooltip contentStyle={{ background: "#101722", border: "1px solid #22314c" }} />
                   <Line type="linear" dataKey="balance" stroke="#2f9bff" strokeWidth={2} dot={false} />
                 </LineChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-
-          <div className="card dashx-chart-card">
-            <h3>Reward:Risk (Monthly)</h3>
-            <div className="dashx-chart-wrap">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={rrBuckets}>
-                  <CartesianGrid stroke="#1c2436" vertical={false} />
-                  <XAxis dataKey="k" stroke="#6f7f9d" tick={{ fontSize: 11 }} />
-                  <YAxis stroke="#6f7f9d" tick={{ fontSize: 11 }} />
-                  <Tooltip contentStyle={{ background: "#101722", border: "1px solid #22314c" }} />
-                  <Bar dataKey="rr" fill="#2f9bff" />
-                </BarChart>
               </ResponsiveContainer>
             </div>
           </div>
