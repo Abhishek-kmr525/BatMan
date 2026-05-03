@@ -125,6 +125,9 @@ class Bot:
 
         active_list = strategies.get_active_list()
         candidates = [m for m in markets if m.close_time_seconds > 5 * 60]
+        if settings.QUICK_EXPIRY_ALWAYS_ON:
+            max_close = max(60, settings.QUICK_EXPIRY_MAX_SECONDS)
+            candidates = [m for m in candidates if m.close_time_seconds <= max_close]
         if active_list:
             # Keep markets matched by ANY active strategy.
             candidates = [m for m in candidates if any(s.filter(m) for s in active_list)]
