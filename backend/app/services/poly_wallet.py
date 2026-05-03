@@ -35,3 +35,14 @@ async def credit(session: AsyncSession, amount: float) -> PolyWallet:
     w.balance = round(w.balance + amount, 4)
     return w
 
+
+async def record_close(session: AsyncSession, pnl: float, win: bool) -> PolyWallet:
+    w = await ensure_wallet_initialized(session)
+    w.total_pnl = round(w.total_pnl + pnl, 4)
+    w.total_trades += 1
+    if win:
+        w.wins += 1
+    else:
+        w.losses += 1
+    return w
+

@@ -131,6 +131,7 @@ class PolymarketBot:
         candidates.sort(key=lambda m: m.volume, reverse=True)
         self.state = "ANALYZING"
         async with SessionLocal() as s:
+            await self._manage_positions(s, poly)
             open_rows = (
                 await s.execute(select(PolyTrade).where(PolyTrade.status == "OPEN"))
             ).scalars().all()
@@ -234,6 +235,64 @@ class PolymarketBot:
             return False
         # Focus only on short windows requested by user: 5m / 15m.
         return any(tok in hay for tok in ("5m", "15m", "5 min", "15 min"))
+
+    async def _manage_positions(self, s, poly) -> None:
+        open_rows = (await s.execute(select(PolyTrade).where(PolyTrade.status == "OPEN"))).scalars().all()
+        if not open_rows:
+            return
+            
+        for t in open_rows:
+            try:
+                res = await poly._http.get(f"https://gamma-api.polymarket.com/markets/{t.market_id}")
+                if res.status_code != 200:
+                    continue
+                data = res.json()
+                closed = data.get("closed", False)
+                active = data.get("active", True)
+                
+                if closed or not active:
+                    raw_outcomes = data.get("outcomePrices")
+                    if isinstance(raw_outcomes, str):
+                        import json
+                        try:
+                            raw_outcomes = json.loads(raw_outcomes)
+                        except Exception:
+                            pass
+                            
+                    if isinstance(raw_outcomes, list) and len(raw_outcomes) >= 2:
+                        val_yes = str(raw_outcomes[0]).strip()
+                        val_no = str(raw_outcomes[1]).strip()
+                        
+                        if val_yes in ("1", "1.0") or val_no in ("1", "1.0"):
+                            yes_won = (val_yes in ("1", "1.0"))
+                            exit_price = 1.0 if (t.direction == "YES" and yes_won) or (t.direction == "NO" and not yes_won) else 0.0
+                            
+                            contracts = t.amount / max(t.entry_price, 0.01)
+                            if exit_price == 1.0:
+                                pnl = (contracts * 1.0) - t.amount
+                                win = True
+                                status = "CLOSED_WIN"
+                            else:
+                                pnl = -t.amount
+                                win = False
+                                status = "CLOSED_LOSS"
+                                
+                            t.status = status
+                            t.exit_price = exit_price
+                            t.pnl = round(pnl, 4)
+                            t.closed_at = datetime.now(timezone.utc)
+                            
+                            await poly_wallet.credit(s, t.amount + t.pnl)
+                            await poly_wallet.record_close(s, t.pnl, win)
+                            await s.commit()
+                            
+                            await self._log("INFO", f"polymarket closed {t.id} {status} pnl={t.pnl:.2f}")
+                            await bus.publish("polymarket:trade:closed", {"id": t.id, "pnl": t.pnl})
+                            w = await poly_wallet.get_wallet(s)
+                            await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
+            except Exception as e:
+                await self._log("ERROR", f"polymarket manage position {t.id} failed: {e}")
+
 
 
 poly_bot = PolymarketBot()
