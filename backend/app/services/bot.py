@@ -125,12 +125,13 @@ class Bot:
         # Fast path: parallel fetch of known-liquid series. Falls back to
         # full pagination only if zero series respond (e.g. Kalshi changed
         # series naming).
-        markets = await kalshi.get_liquid_markets(limit=120, min_volume=10)
+        scan_limit = 600 if settings.QUICK_EXPIRY_ALWAYS_ON else 120
+        markets = await kalshi.get_liquid_markets(limit=scan_limit, min_volume=10)
         if not markets:
-            markets = await kalshi.get_markets(limit=600, min_volume=0, max_pages=80)
+            markets = await kalshi.get_markets(limit=scan_limit, min_volume=0, max_pages=80)
             markets = [m for m in markets if m.volume >= 10]
             markets.sort(key=lambda m: m.volume, reverse=True)
-            markets = markets[:120]
+            markets = markets[:scan_limit]
         self.last_scan_count = len(markets)
         self.scanned_markets_today += len(markets)
         await bus.publish("market:scan", {"count": len(markets)})
