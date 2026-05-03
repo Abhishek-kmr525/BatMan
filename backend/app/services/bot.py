@@ -13,6 +13,7 @@ from app.services import executor, strategies
 from app.services.events import bus
 from app.services.kalshi import get_kalshi
 from app.services.mode_guard import mode_guard
+from app.services.canary_guard import check_kalshi_canary
 from app.services.risk_engine import check_kalshi_entry_risk
 
 State = Literal["IDLE", "SCANNING", "ANALYZING", "EXECUTING", "MONITORING", "STOPPED"]
@@ -186,6 +187,17 @@ class Bot:
                 can_open, reason = mode_guard.can_open_new_trade("kalshi")
                 if not can_open:
                     await self._log("INFO", f"kalshi mode guard blocked open: {reason}")
+                    continue
+                mode = mode_guard.get("kalshi").mode
+                canary_ok, canary_reason, canary_meta = await check_kalshi_canary(
+                    s, mode=mode, order_usd=settings.TRADE_AMOUNT_USD
+                )
+                if not canary_ok:
+                    await self._log(
+                        "INFO",
+                        f"kalshi canary blocked open: {canary_reason}",
+                        canary=canary_meta,
+                    )
                     continue
                 open_positions = await executor.open_count(s)
                 risk = await check_kalshi_entry_risk(

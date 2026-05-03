@@ -47,6 +47,7 @@ Edit `.env` at the repo root. Key flags:
   - `POST /api/mode/confirm-live`
   - `POST /api/mode/set-paper`
   - `POST /api/mode/kill-switch`
+- Phase-4 canary safety API: `GET /api/risk/canary-status` with strict `LIVE_CANARY_*` per-platform limits.
 
 ## API
 

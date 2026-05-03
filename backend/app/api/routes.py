@@ -25,6 +25,7 @@ from app.services.kalshi import Market
 from app.services.mode_guard import mode_guard
 from app.services.polymarket import get_polymarket
 from app.services.wallet_reconcile import reconcile_kalshi_paper, reconcile_polymarket_paper
+from app.services.canary_guard import check_kalshi_canary, check_polymarket_canary
 
 router = APIRouter()
 _MARKET_CLOSE_CACHE: dict[str, tuple[float, int | None]] = {}
@@ -452,6 +453,35 @@ async def risk_reconcile(session: AsyncSession = Depends(get_session)):
         "platforms": {
             "kalshi": kalshi,
             "polymarket": polymarket,
+        },
+    }
+
+
+@router.get("/risk/canary-status")
+async def risk_canary_status(session: AsyncSession = Depends(get_session)):
+    kalshi_mode = mode_guard.get("kalshi").mode
+    polymarket_mode = mode_guard.get("polymarket").mode
+    k_ok, k_reason, k_meta = await check_kalshi_canary(
+        session, mode=kalshi_mode, order_usd=settings.TRADE_AMOUNT_USD
+    )
+    p_ok, p_reason, p_meta = await check_polymarket_canary(
+        session, mode=polymarket_mode, order_usd=settings.POLYMARKET_TRADE_AMOUNT_USD
+    )
+    return {
+        "enabled": settings.LIVE_CANARY_ENABLED,
+        "kalshi": {"mode": kalshi_mode, "ok": k_ok, "reason": k_reason, "meta": k_meta},
+        "polymarket": {"mode": polymarket_mode, "ok": p_ok, "reason": p_reason, "meta": p_meta},
+        "limits": {
+            "kalshi": {
+                "max_order_usd": settings.KALSHI_CANARY_MAX_ORDER_USD,
+                "max_new_trades_per_day": settings.KALSHI_CANARY_MAX_NEW_TRADES_PER_DAY,
+                "max_total_exposure_usd": settings.KALSHI_CANARY_MAX_TOTAL_EXPOSURE_USD,
+            },
+            "polymarket": {
+                "max_order_usd": settings.POLYMARKET_CANARY_MAX_ORDER_USD,
+                "max_new_trades_per_day": settings.POLYMARKET_CANARY_MAX_NEW_TRADES_PER_DAY,
+                "max_total_exposure_usd": settings.POLYMARKET_CANARY_MAX_TOTAL_EXPOSURE_USD,
+            },
         },
     }
 

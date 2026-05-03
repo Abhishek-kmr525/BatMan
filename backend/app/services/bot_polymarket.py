@@ -12,6 +12,7 @@ from app.core.db import SessionLocal
 from app.models.models import BotLog, PolyTrade
 from app.services.events import bus
 from app.services.mode_guard import mode_guard
+from app.services.canary_guard import check_polymarket_canary
 from app.services.polymarket import get_polymarket
 from app.services import poly_wallet
 from app.services.risk_engine import check_polymarket_entry_risk
@@ -147,6 +148,13 @@ class PolymarketBot:
                 can_open, reason = mode_guard.can_open_new_trade("polymarket")
                 if not can_open:
                     await self._log("INFO", f"polymarket mode guard blocked open: {reason}")
+                    continue
+                mode = mode_guard.get("polymarket").mode
+                canary_ok, canary_reason, canary_meta = await check_polymarket_canary(
+                    s, mode=mode, order_usd=amount
+                )
+                if not canary_ok:
+                    await self._log("INFO", f"polymarket canary blocked open: {canary_reason}", canary=canary_meta)
                     continue
                 await poly_wallet.debit(s, amount)
                 t = PolyTrade(
