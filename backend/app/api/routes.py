@@ -13,14 +13,16 @@ from app.agent import knowledge
 from app.agent.analyzer import analyze_market, check_claude_health, check_gemini_health
 from app.core.config import settings
 from app.core.db import get_session
-from app.models.models import BotLog, Trade
+from app.models.models import BotLog, PolyTrade, Trade
 from app.services import executor as exec_svc
-from app.services import strategies, wallet
+from app.services import poly_wallet, strategies, wallet
 from app.services.bot import bot
+from app.services.bot_polymarket import poly_bot
 from app.services.events import bus
 from app.services.intel import gather_market_intel
 from app.services.kalshi import get_kalshi
 from app.services.kalshi import Market
+from app.services.polymarket import get_polymarket
 
 router = APIRouter()
 _MARKET_CLOSE_CACHE: dict[str, tuple[float, int | None]] = {}
@@ -111,6 +113,29 @@ async def maintenance_demo_reset(body: DemoResetBody, session: AsyncSession = De
     return {"ok": True, "balance": w.balance, "trades_deleted": "all"}
 
 
+class PolyResetBody(BaseModel):
+    passcode: str
+    balance: float = 20.0
+
+
+@router.post("/maintenance/poly/reset")
+async def maintenance_poly_reset(body: PolyResetBody, session: AsyncSession = Depends(get_session)):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    await poly_bot.stop()
+    await session.execute(delete(PolyTrade))
+    w = await poly_wallet.get_wallet(session)
+    w.balance = round(max(body.balance, 0.0), 4)
+    w.total_pnl = 0.0
+    w.total_trades = 0
+    w.wins = 0
+    w.losses = 0
+    await session.commit()
+    await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
+    await bus.publish("polymarket:trades:cleared", {"ok": True})
+    return {"ok": True, "balance": w.balance, "trades_deleted": "all"}
+
+
 # ---------- Trades ----------
 @router.get("/trades")
 async def trades_list(
@@ -187,6 +212,95 @@ async def trade_get(trade_id: str, session: AsyncSession = Depends(get_session))
     if not t:
         raise HTTPException(status_code=404, detail="trade not found")
     return _trade_dict(t)
+
+
+# ---------- Polymarket ----------
+@router.post("/polymarket/bot/start")
+async def polymarket_bot_start():
+    await poly_bot.start()
+    return poly_bot.status()
+
+
+@router.post("/polymarket/bot/stop")
+async def polymarket_bot_stop():
+    await poly_bot.stop()
+    return poly_bot.status()
+
+
+@router.get("/polymarket/bot/status")
+async def polymarket_bot_status(session: AsyncSession = Depends(get_session)):
+    res = await session.execute(select(PolyTrade).where(PolyTrade.status == "OPEN"))
+    active = len(list(res.scalars().all()))
+    s = poly_bot.status()
+    s["active_positions"] = active
+    s["max_concurrent_positions"] = settings.POLYMARKET_MAX_OPEN_POSITIONS
+    return s
+
+
+@router.get("/polymarket/wallet")
+async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
+    w = await poly_wallet.get_wallet(session)
+    win_rate = (w.wins / w.total_trades * 100) if w.total_trades else 0.0
+    return {
+        "balance": round(w.balance, 4),
+        "total_pnl": round(w.total_pnl, 4),
+        "total_trades": w.total_trades,
+        "wins": w.wins,
+        "losses": w.losses,
+        "win_rate": round(win_rate, 2),
+    }
+
+
+@router.get("/polymarket/trades")
+async def polymarket_trades(
+    status: str = "open",
+    limit: int = 50,
+    page: int = 1,
+    session: AsyncSession = Depends(get_session),
+):
+    q = select(PolyTrade)
+    if status == "open":
+        q = q.where(PolyTrade.status == "OPEN")
+    elif status == "closed":
+        q = q.where(PolyTrade.status.like("CLOSED%"))
+    q = q.order_by(desc(PolyTrade.opened_at)).offset(max(page - 1, 0) * limit).limit(limit)
+    rows = (await session.execute(q)).scalars().all()
+    return [_poly_trade_dict(t) for t in rows]
+
+
+@router.get("/polymarket/trades/summary")
+async def polymarket_trades_summary(session: AsyncSession = Depends(get_session)):
+    now = datetime.now(timezone.utc)
+    start_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    total = int((await session.execute(select(func.count(PolyTrade.id)))).scalar_one() or 0)
+    open_count = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.status == "OPEN"))).scalar_one() or 0)
+    closed_count = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.status.like("CLOSED%")))).scalar_one() or 0)
+    today_opened = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.opened_at >= start_utc))).scalar_one() or 0)
+    today_closed = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.closed_at.is_not(None), PolyTrade.closed_at >= start_utc))).scalar_one() or 0)
+    return {
+        "total_count": total,
+        "open_count": open_count,
+        "closed_count": closed_count,
+        "today_opened_count": today_opened,
+        "today_closed_count": today_closed,
+    }
+
+
+@router.get("/polymarket/markets")
+async def polymarket_markets(limit: int = 30):
+    poly = get_polymarket()
+    markets = await poly.get_markets(limit=limit)
+    return [
+        {
+            "id": m.id,
+            "title": m.title,
+            "yes_price": m.yes_price,
+            "no_price": m.no_price,
+            "volume": m.volume,
+            "time_to_close_seconds": m.close_time_seconds,
+        }
+        for m in markets
+    ]
 
 
 # ---------- Agent ----------
@@ -582,6 +696,25 @@ def _trade_dict(t: Trade) -> dict:
         "reasoning": t.reasoning,
         "strategy_id": t.strategy_id,
         "source": t.source,
+        "opened_at": t.opened_at,
+        "closed_at": t.closed_at,
+    }
+
+
+def _poly_trade_dict(t: PolyTrade) -> dict:
+    return {
+        "id": t.id,
+        "market_id": t.market_id,
+        "market_title": t.market_title,
+        "direction": t.direction,
+        "amount": t.amount,
+        "entry_price": t.entry_price,
+        "current_price": t.current_price,
+        "exit_price": t.exit_price,
+        "pnl": t.pnl,
+        "status": t.status,
+        "agent_score": t.agent_score,
+        "reasoning": t.reasoning,
         "opened_at": t.opened_at,
         "closed_at": t.closed_at,
     }

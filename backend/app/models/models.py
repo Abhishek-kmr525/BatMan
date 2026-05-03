@@ -67,3 +67,34 @@ class KnowledgeDoc(Base):
     source_file: Mapped[str] = mapped_column(Text, unique=True)
     chunks: Mapped[int] = mapped_column(Integer, default=0)
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class PolyTrade(Base):
+    __tablename__ = "poly_trades"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    market_id: Mapped[str] = mapped_column(String(120), index=True)
+    market_title: Mapped[str] = mapped_column(Text)
+    direction: Mapped[str] = mapped_column(String(10))  # YES or NO
+    amount: Mapped[float] = mapped_column(Float, default=1.00)
+    entry_price: Mapped[float] = mapped_column(Float)
+    current_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(20), default="OPEN", index=True)
+    agent_score: Mapped[int] = mapped_column(Integer, default=0)
+    reasoning: Mapped[str] = mapped_column(Text, default="")
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PolyWallet(Base):
+    __tablename__ = "poly_wallet"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    balance: Mapped[float] = mapped_column(Float, default=20.00)
+    total_pnl: Mapped[float] = mapped_column(Float, default=0.00)
+    total_trades: Mapped[int] = mapped_column(Integer, default=0)
+    wins: Mapped[int] = mapped_column(Integer, default=0)
+    losses: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)

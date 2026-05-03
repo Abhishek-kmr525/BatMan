@@ -18,7 +18,9 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
     async with SessionLocal() as session:
         from app.services.wallet import ensure_wallet_initialized
+        from app.services.poly_wallet import ensure_wallet_initialized as ensure_poly_wallet_initialized
         await ensure_wallet_initialized(session)
+        await ensure_poly_wallet_initialized(session)
         await session.commit()
 
 

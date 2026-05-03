@@ -86,6 +86,7 @@ export default function ClientShell({ children }: { children: React.ReactNode })
           <Link href="/">Dashboard</Link>
           <Link href="/daily-earnings">Daily Earnings</Link>
           <Link href="/trades">All Trades</Link>
+          <Link href="/polymarket">Polymarket</Link>
           <Link href="/strategies">Strategies</Link>
           <Link href="/quick">Quick Trade</Link>
           <Link href="/knowledge">Knowledge</Link>
