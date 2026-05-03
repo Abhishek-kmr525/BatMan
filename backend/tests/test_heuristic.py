@@ -13,11 +13,28 @@ from app.agent.analyzer import (
     check_gemini_health,
 )
 from app.core.config import settings
+from app.services.intel import IntelSnapshot
 from app.services.kalshi import Market
 
 
 def _market(yes: float, vol: int = 1000, close_s: int = 3600) -> Market:
     return Market("X", "test", "Cat", yes, round(1 - yes, 2), vol, 0, close_s, {})
+
+
+def _intel_snapshot(*, block: bool = False, freshness: float = 0.8, velocity: float = 0.5) -> IntelSnapshot:
+    return IntelSnapshot(
+        query="test",
+        news_sentiment_score=0.1,
+        news_velocity=velocity,
+        macro_trend_score=0.0,
+        event_surprise_score=0.2,
+        data_freshness=freshness,
+        confidence_multiplier=0.95,
+        block_trade=block,
+        reasons=[],
+        source_health={},
+        fetched_at="2026-05-03T00:00:00+00:00",
+    )
 
 
 def test_heuristic_picks_cheaper_side():
@@ -74,7 +91,11 @@ def test_heuristic_skips_very_short_time_even_with_edge():
 
 
 def test_local_skill_score_skips_tiny_entry_price():
-    h = _local_skill_score(_market(0.01, vol=3000, close_s=3 * 3600), [])
+    h = _local_skill_score(
+        _market(0.01, vol=3000, close_s=3 * 3600),
+        [],
+        _intel_snapshot().as_dict(),
+    )
     assert h["action"] == "SKIP"
 
 
@@ -108,6 +129,7 @@ def test_local_skill_score_uses_multiple_skills():
     h = _local_skill_score(
         _market(0.12, vol=3000, close_s=3 * 3600),
         [{"text": "Trading probability risk management liquidity breakout", "metadata": {"file_name": "x.pdf", "page": 1}}],
+        _intel_snapshot().as_dict(),
     )
     assert h["provider"] == "local"
     assert set(h["skills"]) == {
@@ -116,6 +138,7 @@ def test_local_skill_score_uses_multiple_skills():
         "time",
         "market_clarity",
         "knowledge_match",
+        "external_intel",
     }
     assert h["score"] >= 0
     assert h["entry_price"] == 0.12
@@ -127,6 +150,9 @@ def test_local_skill_score_uses_multiple_skills():
 async def test_analyze_market_local_provider_does_not_call_claude(monkeypatch):
     monkeypatch.setattr(settings, "ANALYZER_PROVIDER", "local")
     monkeypatch.setattr(settings, "LOCAL_ANALYZER_USE_RAG", False)
+    async def fake_intel(*_args, **_kwargs):
+        return _intel_snapshot()
+    monkeypatch.setattr("app.agent.analyzer.gather_market_intel", fake_intel)
     rag_called = False
 
     def fail_if_rag_called(*_args, **_kw):
@@ -179,8 +205,21 @@ def test_gemini_reviewer_can_reject_high_score_signal(monkeypatch):
             "reason": "event edge is not clear",
         },
     )
-    h = _local_skill_score(_market(0.12, vol=3000, close_s=3 * 3600), [])
+    h = _local_skill_score(
+        _market(0.12, vol=3000, close_s=3 * 3600),
+        [],
+        _intel_snapshot().as_dict(),
+    )
     from app.agent.analyzer import _maybe_apply_gemini_review
     reviewed = _maybe_apply_gemini_review(_market(0.12, vol=3000, close_s=3 * 3600), h)
     assert reviewed["action"] == "SKIP"
     assert reviewed["ai_review"]["decision"] == "REJECT"
+
+
+def test_local_skill_score_blocks_when_intel_flags_trade():
+    h = _local_skill_score(
+        _market(0.12, vol=3000, close_s=3 * 3600),
+        [],
+        _intel_snapshot(block=True).as_dict(),
+    )
+    assert h["action"] == "SKIP"

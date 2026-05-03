@@ -18,7 +18,9 @@ from app.services import executor as exec_svc
 from app.services import strategies, wallet
 from app.services.bot import bot
 from app.services.events import bus
+from app.services.intel import gather_market_intel
 from app.services.kalshi import get_kalshi
+from app.services.kalshi import Market
 
 router = APIRouter()
 _MARKET_CLOSE_CACHE: dict[str, tuple[float, int | None]] = {}
@@ -220,6 +222,25 @@ async def agent_claude_health():
 @router.get("/agent/gemini/health")
 async def agent_gemini_health():
     return await asyncio.to_thread(check_gemini_health)
+
+
+@router.get("/agent/intel/health")
+async def agent_intel_health():
+    probe = Market(
+        ticker="INTEL-HEALTH",
+        title="Will external intel pipeline return healthy signals?",
+        category="System",
+        yes_price=0.5,
+        no_price=0.5,
+        volume=1000,
+        open_interest=500,
+        close_time_seconds=3600,
+        raw={},
+    )
+    intel = await gather_market_intel(probe)
+    payload = intel.as_dict()
+    payload["ok"] = not payload.get("block_trade", False)
+    return payload
 
 
 @router.get("/agent/logs")

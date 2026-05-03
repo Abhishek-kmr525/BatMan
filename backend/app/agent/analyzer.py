@@ -17,6 +17,7 @@ from anthropic import (
 
 from app.agent import knowledge
 from app.core.config import settings
+from app.services.intel import gather_market_intel
 from app.services.kalshi import Market
 
 _client: Anthropic | None = None
@@ -98,13 +99,22 @@ def _build_user_prompt(market: Market, chunks: list[dict]) -> str:
     )
 
 
+def _build_user_prompt_with_intel(market: Market, chunks: list[dict], intel: dict) -> str:
+    base = _build_user_prompt(market, chunks)
+    intel_json = json.dumps(intel, indent=2)
+    return f"{base}\n\nEXTERNAL_INTEL:\n{intel_json}\n\nReturn JSON only."
+
+
 async def analyze_market(market: Market) -> Analysis:
     rag_query = f"Kalshi {market.category} market: {market.title}"
+    intel = await gather_market_intel(market)
+    intel_dict = intel.as_dict()
 
     if settings.ANALYZER_PROVIDER.lower() != "claude":
         chunks = _safe_local_context(rag_query) if settings.LOCAL_ANALYZER_USE_RAG else []
-        data = _local_skill_score(market, chunks)
+        data = _local_skill_score(market, chunks, intel_dict)
         data = _maybe_apply_gemini_review(market, data)
+        data["intel"] = intel_dict
         sources = data.get("knowledge_sources") or [
             f"{(c['metadata'] or {}).get('file_name','?')} p.{(c['metadata'] or {}).get('page','?')}"
             for c in chunks
@@ -117,7 +127,7 @@ async def analyze_market(market: Market) -> Analysis:
             model=settings.CLAUDE_MODEL,
             max_tokens=600,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": _build_user_prompt(market, chunks)}],
+            messages=[{"role": "user", "content": _build_user_prompt_with_intel(market, chunks, intel_dict)}],
         )
         text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
         text = _strip_code_fence(text)
@@ -133,6 +143,7 @@ async def analyze_market(market: Market) -> Analysis:
         f"{(c['metadata'] or {}).get('file_name','?')} p.{(c['metadata'] or {}).get('page','?')}"
         for c in chunks
     ]
+    data["intel"] = intel_dict
     return _analysis_from_data(market, data, sources)
 
 
@@ -150,13 +161,14 @@ def _analysis_from_data(market: Market, data: dict, sources: list[str]) -> Analy
     )
 
 
-def _local_skill_score(market: Market, chunks: list[dict]) -> dict:
+def _local_skill_score(market: Market, chunks: list[dict], intel: dict | None = None) -> dict:
     """Free analyzer assembled from small deterministic trading skills."""
     side_signal = _skill_side_and_edge(market)
     liquidity = _skill_liquidity(market)
     time_signal = _skill_time(market)
     clarity = _skill_clarity(market)
     knowledge_signal = _skill_knowledge_match(market, chunks)
+    intel_signal = _skill_external_intel(intel)
 
     entry = side_signal["entry"]
     score_raw = (
@@ -165,7 +177,8 @@ def _local_skill_score(market: Market, chunks: list[dict]) -> dict:
         + liquidity["score"] * 0.18
         + time_signal["score"] * 0.16
         + clarity["score"] * 0.12
-        + knowledge_signal["score"] * 0.20
+        + knowledge_signal["score"] * 0.18
+        + intel_signal["score"] * 0.08
     )
     score = int(round(_clamp(score_raw, 0.0, 99.0)))
 
@@ -184,12 +197,14 @@ def _local_skill_score(market: Market, chunks: list[dict]) -> dict:
             + liquidity["norm"] * 0.18
             + time_signal["quality"] * 0.18
             + clarity["norm"] * 0.08
-            + knowledge_signal["norm"] * 0.08,
+            + knowledge_signal["norm"] * 0.08
+            + intel_signal["norm"] * 0.06,
             0.05,
             0.95,
         ),
         2,
     )
+    confidence = round(_clamp(confidence * intel_signal["confidence_multiplier"], 0.05, 0.95), 2)
 
     tradable = (
         score >= settings.MIN_TRADE_SCORE
@@ -198,6 +213,7 @@ def _local_skill_score(market: Market, chunks: list[dict]) -> dict:
         and market.volume >= 25
         and market.close_time_seconds >= 8 * 60
         and clarity["norm"] >= 0.35
+        and not intel_signal["block_trade"]
     )
 
     reason_parts = [
@@ -207,6 +223,7 @@ def _local_skill_score(market: Market, chunks: list[dict]) -> dict:
         f"liq {liquidity['norm']:.2f}",
         f"time {time_signal['label']}",
         f"kb {knowledge_signal['label']}",
+        f"intel {intel_signal['label']}",
         f"target {target:.2f} (+{tp_move:.2f})",
         f"stop {stop:.2f} (-{sl_move:.2f})",
     ]
@@ -226,6 +243,7 @@ def _local_skill_score(market: Market, chunks: list[dict]) -> dict:
             "time": time_signal,
             "market_clarity": clarity,
             "knowledge_match": knowledge_signal,
+            "external_intel": intel_signal,
         },
         "provider": "local",
     }
@@ -578,6 +596,44 @@ def _skill_knowledge_match(market: Market, chunks: list[dict]) -> dict:
     else:
         label = "weak pdf match"
     return {"norm": best, "score": best * 100, "label": label, "sources": sources}
+
+
+def _skill_external_intel(intel: dict | None) -> dict:
+    if not intel:
+        return {
+            "norm": 0.45,
+            "score": 45.0,
+            "label": "intel unavailable",
+            "confidence_multiplier": 0.9,
+            "block_trade": False,
+            "reasons": [],
+        }
+    freshness = _clamp(float(intel.get("data_freshness", 0.0)), 0.0, 1.0)
+    velocity = _clamp(float(intel.get("news_velocity", 0.0)), 0.0, 1.0)
+    sentiment = _clamp(abs(float(intel.get("news_sentiment_score", 0.0))), 0.0, 1.0)
+    macro = _clamp(1.0 - abs(float(intel.get("macro_trend_score", 0.0))), 0.0, 1.0)
+    norm = _clamp(freshness * 0.44 + velocity * 0.28 + sentiment * 0.18 + macro * 0.10, 0.0, 1.0)
+    reasons = list(intel.get("reasons") or [])
+    return {
+        "norm": norm,
+        "score": norm * 100,
+        "label": _intel_label(norm, bool(intel.get("block_trade")), reasons),
+        "confidence_multiplier": _clamp(float(intel.get("confidence_multiplier", 1.0)), 0.45, 1.05),
+        "block_trade": bool(intel.get("block_trade", False)),
+        "reasons": reasons,
+    }
+
+
+def _intel_label(norm: float, block_trade: bool, reasons: list[str]) -> str:
+    if block_trade:
+        return "blocked: weak external signal"
+    if norm >= 0.7:
+        return "strong external signal"
+    if norm >= 0.4:
+        return "moderate external signal"
+    if reasons:
+        return f"weak external signal ({reasons[0]})"
+    return "weak external signal"
 
 
 def _terms(text: str) -> set[str]:

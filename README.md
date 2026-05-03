@@ -26,7 +26,7 @@ Open http://localhost:3000.
 
 1. Backend boots → creates `data/amta.db`, seeds wallet at $10,000.
 2. From the dashboard, click **Reload PDFs** to ingest the knowledge base (one-time, takes a few minutes).
-3. Click **▶ Start Bot**. The bot scans markets every 30s, asks Claude to score them against the PDF knowledge, and opens $1 positions on any market scoring ≥ 65.
+3. Click **▶ Start Bot**. The bot scans markets every 30s, enriches each market with external intel (GDELT, Guardian, FRED, BLS), scores with local/Claude analyzer, and opens $1 positions on markets scoring ≥ 65.
 4. Open positions appear live; trades close on take-profit / stop-loss / time-exit. Wallet updates each tick.
 
 ## Configuration
@@ -36,6 +36,8 @@ Edit `.env` at the repo root. Key flags:
 - `KALSHI_DEMO=true` — runs against the built-in mock market generator (no Kalshi creds required). Set to `false` and fill Kalshi credentials.
 - `KNOWLEDGE_PDF_DIR` — path to your PDFs.
 - `MIN_TRADE_SCORE`, `MAX_CONCURRENT_POSITIONS`, `BOT_SCAN_INTERVAL_SECONDS` — agent tuning.
+- `INTEL_FEATURES_ENABLED`, `INTEL_STRICT_SKIP` — enable/disable external intel gating.
+- `GUARDIAN_API_KEY` defaults to `test`; `FRED_API_KEY` is optional but required for FRED signals.
 
 ## API
 

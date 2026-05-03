@@ -45,6 +45,20 @@ class Settings(BaseSettings):
     EMBEDDING_PROVIDER: str = "local"  # "local" | "openai"
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
 
+    INTEL_FEATURES_ENABLED: bool = True
+    INTEL_USE_GDELT: bool = True
+    INTEL_USE_GUARDIAN: bool = True
+    INTEL_USE_FRED: bool = True
+    INTEL_USE_BLS: bool = True
+    GUARDIAN_API_KEY: str = "test"
+    FRED_API_KEY: str = ""
+    INTEL_REQUEST_TIMEOUT_SECONDS: float = 12.0
+    INTEL_CACHE_TTL_SECONDS: int = 600
+    INTEL_GDELT_MIN_INTERVAL_SECONDS: int = 6
+    INTEL_MIN_FRESHNESS: float = 0.22
+    INTEL_MIN_NEWS_ITEMS: int = 2
+    INTEL_STRICT_SKIP: bool = True
+
     BOT_SCAN_INTERVAL_SECONDS: int = 30
     TRADE_AMOUNT_USD: float = 1.00
     MIN_TRADE_SCORE: int = 65
