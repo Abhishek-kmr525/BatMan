@@ -387,6 +387,9 @@ async def polymarket_candles(
         raise HTTPException(status_code=400, detail="interval must be 5m or 15m")
     limit = max(20, min(300, int(limit)))
     sym = symbol.upper().strip()
+    out = []
+    last_err = None
+    # Primary source: Binance.
     try:
         async with httpx.AsyncClient(timeout=12.0) as h:
             r = await h.get(
@@ -395,24 +398,49 @@ async def polymarket_candles(
             )
             r.raise_for_status()
             rows = r.json()
+        for row in rows:
+            out.append(
+                {
+                    "t": int(row[0]),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                }
+            )
+        return {"symbol": sym, "interval": interval, "source": "binance", "candles": out}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"candle fetch failed: {e}")
+        last_err = str(e)
 
-    out = []
-    for row in rows:
-        # Binance kline format:
-        # [openTime, open, high, low, close, volume, closeTime, ...]
-        out.append(
-            {
-                "t": int(row[0]),
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[5]),
-            }
-        )
-    return {"symbol": sym, "interval": interval, "candles": out}
+    # Fallback source: Coinbase Exchange candles.
+    # Coinbase format: [time, low, high, open, close, volume]
+    try:
+        granularity = 300 if interval == "5m" else 900
+        product = "BTC-USD" if sym == "BTCUSDT" else "ETH-USD"
+        async with httpx.AsyncClient(timeout=12.0) as h:
+            r = await h.get(
+                f"https://api.exchange.coinbase.com/products/{product}/candles",
+                params={"granularity": granularity},
+                headers={"Accept": "application/json"},
+            )
+            r.raise_for_status()
+            rows = r.json()
+        rows = rows[:limit]
+        for row in reversed(rows):
+            out.append(
+                {
+                    "t": int(row[0]) * 1000,
+                    "open": float(row[3]),
+                    "high": float(row[2]),
+                    "low": float(row[1]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                }
+            )
+        return {"symbol": product, "interval": interval, "source": "coinbase", "candles": out}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"candle fetch failed: primary={last_err}; fallback={e}")
 
 
 # ---------- Agent ----------
