@@ -23,6 +23,7 @@ from app.services.intel import gather_market_intel
 from app.services.kalshi import get_kalshi
 from app.services.kalshi import Market
 from app.services.polymarket import get_polymarket
+from app.services.wallet_reconcile import reconcile_kalshi_paper, reconcile_polymarket_paper
 
 router = APIRouter()
 _MARKET_CLOSE_CACHE: dict[str, tuple[float, int | None]] = {}
@@ -355,6 +356,39 @@ async def agent_intel_health():
     payload = intel.as_dict()
     payload["ok"] = not payload.get("block_trade", False)
     return payload
+
+
+@router.get("/risk/limits")
+async def risk_limits():
+    return {
+        "kalshi": {
+            "max_daily_loss_usd": settings.KALSHI_MAX_DAILY_LOSS_USD,
+            "max_open_positions": settings.MAX_CONCURRENT_POSITIONS,
+            "min_trade_score": settings.MIN_TRADE_SCORE,
+        },
+        "polymarket": {
+            "max_daily_loss_usd": settings.POLYMARKET_MAX_DAILY_LOSS_USD,
+            "max_open_positions": settings.POLYMARKET_MAX_OPEN_POSITIONS,
+            "min_trade_score": settings.POLYMARKET_MIN_SCORE,
+            "time_window_seconds": [
+                settings.POLYMARKET_MIN_TIME_TO_CLOSE_SECONDS,
+                settings.POLYMARKET_MAX_TIME_TO_CLOSE_SECONDS,
+            ],
+        },
+    }
+
+
+@router.get("/risk/reconcile")
+async def risk_reconcile(session: AsyncSession = Depends(get_session)):
+    kalshi = await reconcile_kalshi_paper(session)
+    polymarket = await reconcile_polymarket_paper(session)
+    return {
+        "ok": bool(kalshi.get("ok")) and bool(polymarket.get("ok")),
+        "platforms": {
+            "kalshi": kalshi,
+            "polymarket": polymarket,
+        },
+    }
 
 
 @router.get("/agent/logs")

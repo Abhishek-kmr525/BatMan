@@ -13,6 +13,7 @@ from app.models.models import BotLog, PolyTrade
 from app.services.events import bus
 from app.services.polymarket import get_polymarket
 from app.services import poly_wallet
+from app.services.risk_engine import check_polymarket_entry_risk
 
 State = Literal["IDLE", "SCANNING", "ANALYZING", "EXECUTING", "STOPPED"]
 
@@ -131,7 +132,11 @@ class PolymarketBot:
                 entry = m.yes_price if side == "YES" else m.no_price
                 edge = max(0.0, 0.5 - entry)
                 score = int(round(min(99, 52 + edge * 90 + min(m.volume / 4000.0, 1.0) * 22)))
-                if score < settings.POLYMARKET_MIN_SCORE:
+                risk = await check_polymarket_entry_risk(
+                    s, m, score=score, open_positions=len(open_rows)
+                )
+                if not risk.allow:
+                    await self._log("INFO", f"polymarket risk blocked {m.id}: {risk.reason}", risk=risk.meta)
                     continue
                 amount = settings.POLYMARKET_TRADE_AMOUNT_USD
                 if wallet.balance < amount:
@@ -164,4 +169,3 @@ class PolymarketBot:
 
 
 poly_bot = PolymarketBot()
-

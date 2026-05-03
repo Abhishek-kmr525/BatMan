@@ -40,6 +40,7 @@ Edit `.env` at the repo root. Key flags:
 - `GUARDIAN_API_KEY` defaults to `test`; `FRED_API_KEY` is optional but required for FRED signals.
 - `QUICK_EXPIRY_ALWAYS_ON=true` with `QUICK_EXPIRY_MIN_SECONDS` and `QUICK_EXPIRY_MAX_SECONDS` constrains trading to a time window (e.g. 60..86400 seconds).
 - `POLYMARKET_*` variables control the separate phase-1 Polymarket paper bot (page: `/polymarket`).
+- Phase-2 safety APIs: `GET /api/risk/limits` and `GET /api/risk/reconcile` (paper wallet consistency + shared risk guard visibility).
 
 ## API
 
