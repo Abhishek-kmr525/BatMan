@@ -111,6 +111,18 @@ class PolymarketBot:
             m for m in markets
             if min_t <= m.close_time_seconds <= max_t and m.volume >= 300
         ]
+        if settings.POLYMARKET_PREFER_MICRO_UPDOWN:
+            micro = [
+                m for m in markets
+                if self._is_micro_updown(m)
+                and min_t <= m.close_time_seconds <= max_t
+                and m.close_time_seconds <= max(
+                    min_t, settings.POLYMARKET_MICRO_MAX_TIME_TO_CLOSE_SECONDS
+                )
+                and m.volume >= settings.POLYMARKET_MICRO_MIN_VOLUME
+            ]
+            if micro:
+                candidates = micro
         self.last_candidate_count = len(candidates)
         if not candidates:
             return
@@ -134,6 +146,8 @@ class PolymarketBot:
                 entry = m.yes_price if side == "YES" else m.no_price
                 edge = max(0.0, 0.5 - entry)
                 score = int(round(min(99, 52 + edge * 90 + min(m.volume / 4000.0, 1.0) * 22)))
+                if self._is_micro_updown(m):
+                    score = min(99, score + 8)
                 risk = await check_polymarket_entry_risk(
                     s, m, score=score, open_positions=len(open_rows)
                 )
@@ -179,6 +193,14 @@ class PolymarketBot:
                 await self._log("INFO", f"polymarket opened {side} {m.id} @ {entry}")
                 # One new trade per tick to keep phase-1 controlled.
                 break
+
+    @staticmethod
+    def _is_micro_updown(m) -> bool:
+        title = (m.title or "").lower()
+        slug = str((m.raw or {}).get("slug") or "").lower()
+        event_slug = str((((m.raw or {}).get("events") or [{}])[0].get("slug") or "")).lower()
+        hay = f"{title} {slug} {event_slug}"
+        return ("up or down" in hay) or ("updown" in hay)
 
 
 poly_bot = PolymarketBot()
