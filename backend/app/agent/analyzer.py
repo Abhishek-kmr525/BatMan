@@ -206,10 +206,20 @@ def _local_skill_score(market: Market, chunks: list[dict], intel: dict | None = 
     )
     confidence = round(_clamp(confidence * intel_signal["confidence_multiplier"], 0.05, 0.95), 2)
 
+    # Allow deep-underdog tickets only when knowledge or external intel
+    # gives us a concrete contrarian thesis (knowledge_norm or intel_norm
+    # >= 0.6) — otherwise we're just buying the long tail.
+    has_contrarian_thesis = (
+        knowledge_signal["norm"] >= 0.6 or intel_signal["norm"] >= 0.6
+    )
+    price_floor = settings.MIN_ENTRY_PRICE if not has_contrarian_thesis else 0.05
+    price_ceiling = settings.MAX_ENTRY_PRICE
+
     tradable = (
         score >= settings.MIN_TRADE_SCORE
-        and side_signal["edge"] >= 0.06
-        and entry >= settings.MIN_ENTRY_PRICE
+        and side_signal["edge_norm"] >= 0.45
+        and entry >= price_floor
+        and entry <= price_ceiling
         and market.volume >= 25
         and market.close_time_seconds >= 8 * 60
         and clarity["norm"] >= 0.35
@@ -524,19 +534,50 @@ def _heuristic_score(market: Market, reason: str = "heuristic") -> dict:
 
 
 def _skill_side_and_edge(market: Market) -> dict:
+    """Price-quality skill.
+
+    On Kalshi the displayed price IS the consensus probability. Buying the
+    cheap side blindly is a negative-EV bet on the long tail. This skill now
+    rewards entries in the uncertain "Goldilocks" zone (~$0.30-$0.70) and
+    penalises both deep-underdog tickets (<$0.20) and expensive favourites
+    (>$0.80). The bot still picks the cheaper side by default, but the score
+    no longer encourages buying $0.03 lottery tickets.
+    """
     yes = market.yes_price
     no = market.no_price
     side = "YES" if yes <= no else "NO"
     entry = yes if side == "YES" else no
-    edge = max(0.0, 0.5 - entry)
-    edge_norm = _clamp(edge / 0.35, 0.0, 1.0)
-    mid_penalty = _clamp((0.10 - edge) / 0.10, 0.0, 1.0)
+
+    # Goldilocks centred at 0.50, peaking when price is between 0.30 and 0.70.
+    # Hard floor: anything <0.20 gets a near-zero quality score.
+    if entry < 0.10:
+        quality = 0.05
+    elif entry < 0.20:
+        quality = 0.20
+    elif entry < 0.30:
+        quality = 0.55
+    elif entry <= 0.70:
+        quality = 1.0
+    elif entry <= 0.85:
+        quality = 0.55
+    else:
+        quality = 0.25
+
+    # Distance from 0.50 still matters a little — symmetric uncertainty bonus.
+    uncertainty = 1.0 - min(0.5, abs(entry - 0.5)) * 2.0  # 1.0 at 0.50, 0.0 at 0/1
+    edge_norm = _clamp(0.7 * quality + 0.3 * uncertainty, 0.0, 1.0)
+
+    # Keep the legacy "edge" key for downstream code that reads it, but make
+    # it reflect price quality rather than mere cheapness.
+    edge = round(edge_norm * 0.35, 4)
+
     return {
         "side": side,
         "entry": entry,
         "edge": edge,
         "edge_norm": edge_norm,
-        "score": _clamp(edge_norm * 100 - mid_penalty * 35, 0.0, 100.0),
+        "quality": quality,
+        "score": _clamp(edge_norm * 100, 0.0, 100.0),
     }
 
 
@@ -657,8 +698,13 @@ def _risk_prices(
     tp_mult = _tp_time_multiplier(close_seconds)
     tp_move = round(_clamp(base_move * tp_mult, 0.02, 0.20), 2)
     rr_to_stop = 0.58 + (1.0 - liquidity_norm) * 0.15 + (1.0 - time_quality) * 0.12
-    stop_cap = max(0.01, min(0.15, round(entry - 0.01, 2)))
-    sl_move = round(_clamp(tp_move * rr_to_stop, 0.01, stop_cap), 2)
+    # Stop-loss policy: at least 4 cents, at most 40% of entry. The previous
+    # logic let stops collapse to 1 cent on cheap entries, which got us
+    # whipsawed out by single-tick noise. The floor is in absolute cents so
+    # a $0.20 entry now risks 4-8¢ instead of 1¢.
+    sl_floor = 0.04
+    sl_ceiling = max(sl_floor, round(entry * 0.40, 2))
+    sl_move = round(_clamp(tp_move * rr_to_stop, sl_floor, sl_ceiling), 2)
     target = round(_clamp(entry + tp_move, 0.01, 0.97), 2)
     stop = round(_clamp(entry - sl_move, 0.01, 0.96), 2)
     if stop >= entry:

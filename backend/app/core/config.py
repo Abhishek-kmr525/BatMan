@@ -93,7 +93,14 @@ class Settings(BaseSettings):
     BOT_SCAN_INTERVAL_SECONDS: int = 30
     TRADE_AMOUNT_USD: float = 1.00
     MIN_TRADE_SCORE: int = 65
-    MIN_ENTRY_PRICE: float = 0.03
+    # Refuse deep-underdog Kalshi tickets — they are negative-EV by default
+    # and stop-loss whipsaw eats the few wins. 0.20 keeps us in markets where
+    # a few-cent move is feasible and stops are wider in absolute terms.
+    MIN_ENTRY_PRICE: float = 0.20
+    MAX_ENTRY_PRICE: float = 0.85
+    # Skip entering a sister bucket if we already hold a position in the same
+    # series (e.g. multiple "Bitcoin price on May 3" strikes).
+    DEDUP_BUCKET_SERIES: bool = True
     MAX_CONCURRENT_POSITIONS: int = 20
     MAX_ANALYSES_PER_TICK: int = 20
     STARTING_BALANCE: float = 10000.00

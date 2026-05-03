@@ -19,6 +19,22 @@ from app.services.risk_engine import check_kalshi_entry_risk
 State = Literal["IDLE", "SCANNING", "ANALYZING", "EXECUTING", "MONITORING", "STOPPED"]
 
 
+def _series_key(market_id: str | None, market_title: str | None) -> str | None:
+    """Derive a series key from a Kalshi ticker so sister buckets dedup.
+
+    Tickers look like ``KXBTCD-26MAY0315-T78799.99``. The strike segment
+    ``-T...`` is dropped so every strike on the same series shares a key.
+    Falls back to a normalised title prefix if the ticker doesn't match.
+    """
+    mid = (market_id or "").strip()
+    if mid:
+        if "-T" in mid:
+            return mid.rsplit("-T", 1)[0]
+        return mid.rsplit("-", 1)[0] if "-" in mid else mid
+    title = (market_title or "").strip().lower()
+    return title[:60] if title else None
+
+
 class Bot:
     def __init__(self) -> None:
         self.state: State = "STOPPED"
@@ -156,9 +172,29 @@ class Bot:
         async with SessionLocal() as s:
             opens = await executor.open_count(s)
             slots = max(0, settings.MAX_CONCURRENT_POSITIONS - opens)
+            # Build a set of "series keys" from currently-open trades so we
+            # don't open a sister bucket of the same Kalshi series. Kalshi
+            # tickers look like KXBTCD-26MAY0315-T78799.99 — the series key
+            # is everything before the strike segment ("-T...").
+            open_series_keys: set[str] = set()
+            if settings.DEDUP_BUCKET_SERIES:
+                from sqlalchemy import select as _sql_select
+                from app.models.models import Trade as _Trade
+                rows = (await s.execute(
+                    _sql_select(_Trade.market_id, _Trade.market_title).where(_Trade.status == "OPEN")
+                )).all()
+                for mid, title in rows:
+                    key = _series_key(mid, title)
+                    if key:
+                        open_series_keys.add(key)
 
         analyzed = 0
+        opened_series_this_tick: set[str] = set()
         for market in candidates:
+            if settings.DEDUP_BUCKET_SERIES:
+                series = _series_key(market.ticker, market.title)
+                if series and (series in open_series_keys or series in opened_series_this_tick):
+                    continue
             if self._stop_event.is_set():
                 break
             if slots <= 0:
@@ -219,6 +255,10 @@ class Bot:
                 if trade is not None:
                     await s.commit()
                     self.trades_today += 1
+                    if settings.DEDUP_BUCKET_SERIES:
+                        sk = _series_key(trade.market_id, trade.market_title)
+                        if sk:
+                            opened_series_this_tick.add(sk)
                     await bus.publish(
                         "trade:opened",
                         {
