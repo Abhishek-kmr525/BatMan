@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import json
 from typing import Any
 
 import httpx
@@ -57,8 +58,9 @@ def _parse_market(row: dict[str, Any]) -> PolyMarket | None:
         return None
     m_id = str(row.get("id") or row.get("conditionId") or title[:40])
 
-    yes = _safe_price(row.get("yesPrice"), fallback=0.5)
-    no = _safe_price(row.get("noPrice"), fallback=round(1 - yes, 4))
+    parsed_yes, parsed_no = _parse_outcome_prices(row.get("outcomePrices"))
+    yes = _safe_price(row.get("yesPrice"), fallback=parsed_yes)
+    no = _safe_price(row.get("noPrice"), fallback=parsed_no if parsed_no is not None else round(1 - yes, 4))
     if yes <= 0 or yes >= 1:
         yes = 0.5
     if no <= 0 or no >= 1:
@@ -109,6 +111,23 @@ def _safe_float(value: Any, fallback: float = 0.0) -> float:
         return float(value)
     except Exception:
         return fallback
+
+
+def _parse_outcome_prices(value: Any) -> tuple[float, float]:
+    # Gamma frequently returns this as a JSON-encoded string: ["0.53","0.47"].
+    if value is None:
+        return 0.5, 0.5
+    raw = value
+    if isinstance(value, str):
+        try:
+            raw = json.loads(value)
+        except Exception:
+            return 0.5, 0.5
+    if not isinstance(raw, list) or len(raw) < 2:
+        return 0.5, 0.5
+    yes = _safe_price(raw[0], fallback=0.5)
+    no = _safe_price(raw[1], fallback=round(1 - yes, 4))
+    return yes, no
 
 
 def _mock_markets(limit: int) -> list[PolyMarket]:
