@@ -69,27 +69,35 @@ export default function Dashboard() {
   const wsRef = useRef<WebSocket | null>(null);
 
   async function refresh() {
+    const safe = async <T,>(p: Promise<T>) => {
+      try {
+        return { ok: true as const, value: await p };
+      } catch (e: any) {
+        return { ok: false as const, error: e?.message || "request failed" };
+      }
+    };
     try {
-      const [w, b, o, c, l, s] = await Promise.all([
-        api<Wallet>("/wallet"),
-        api<BotStatus>("/bot/status"),
-        api<Trade[]>("/trades?status=open&limit=50"),
-        api<Trade[]>("/trades?status=closed&limit=50"),
-        api<LogEntry[]>("/agent/logs?limit=50"),
-        api<TradeSummary>("/trades/summary"),
+      const [w, b, o, c, l, s, all] = await Promise.all([
+        safe(api<Wallet>("/wallet")),
+        safe(api<BotStatus>("/bot/status")),
+        safe(api<Trade[]>("/trades?status=open&limit=50")),
+        safe(api<Trade[]>("/trades?status=closed&limit=50")),
+        safe(api<LogEntry[]>("/agent/logs?limit=50")),
+        safe(api<TradeSummary>("/trades/summary")),
+        safe(api<Trade[]>("/trades?status=all&limit=500&page=1")),
       ]);
-      const all = await api<Trade[]>("/trades?status=all&limit=500&page=1");
-      setWallet(w);
-      setBot(b);
-      setOpen(o);
-      setClosed(c);
-      setAllTrades(all);
-      setLogs(l);
-      setSummary(s);
-      setError(null);
+
+      if (w.ok) setWallet(w.value);
+      if (b.ok) setBot(b.value);
+      if (o.ok) setOpen(o.value);
+      if (c.ok) setClosed(c.value);
+      if (all.ok) setAllTrades(all.value);
+      if (l.ok) setLogs(l.value);
+      if (s.ok) setSummary(s.value);
 
       // build cumulative P&L vs time from closed trades (oldest -> newest)
-      const sorted = [...c].reverse();
+      const closedRows = c.ok ? c.value : closed;
+      const sorted = [...closedRows].reverse();
       let acc = 0;
       setPnl(sorted.map(t => {
         acc += t.pnl || 0;
@@ -97,6 +105,13 @@ export default function Dashboard() {
         const label = ts.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
         return { t: label, pnl: Number(acc.toFixed(4)) };
       }));
+
+      const failures = [w, b, o, c, l, s, all].filter((x) => !x.ok);
+      if (failures.length === 0) {
+        setError(null);
+      } else {
+        setError(`partial refresh: ${failures.length} endpoint(s) failed`);
+      }
     } catch (e: any) {
       setError(e?.message || "refresh failed");
     }
