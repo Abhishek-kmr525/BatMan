@@ -71,7 +71,10 @@ class Settings(BaseSettings):
     POLYMARKET_MAX_TIME_TO_CLOSE_SECONDS: int = 7776000
     POLYMARKET_PREFER_MICRO_UPDOWN: bool = True
     POLYMARKET_MICRO_MAX_TIME_TO_CLOSE_SECONDS: int = 1800
-    POLYMARKET_MICRO_MIN_VOLUME: float = 50.0
+    # Up/down 5m markets often start fresh at $0-$50 volume, so we accept any
+    # liquidity by default and lean on AI score instead.
+    POLYMARKET_MICRO_MIN_VOLUME: float = 0.0
+    POLYMARKET_MAX_OPENS_PER_TICK: int = 5
     POLYMARKET_STARTING_BALANCE: float = 20.00
     POLYMARKET_MAX_DAILY_LOSS_USD: float = 6.00
 

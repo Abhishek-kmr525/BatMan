@@ -15,6 +15,7 @@ from app.services.mode_guard import mode_guard
 from app.services.canary_guard import check_polymarket_canary
 from app.services.polymarket import get_polymarket
 from app.services import poly_wallet
+from app.services.poly_analyzer import analyze_polymarket
 from app.services.risk_engine import check_polymarket_entry_risk
 
 State = Literal["IDLE", "SCANNING", "ANALYZING", "EXECUTING", "STOPPED"]
@@ -139,17 +140,28 @@ class PolymarketBot:
             open_market_ids = {t.market_id for t in open_rows}
             wallet = await poly_wallet.get_wallet(s)
 
+            opened_this_tick = 0
+            max_per_tick = max(1, getattr(settings, "POLYMARKET_MAX_OPENS_PER_TICK", 5))
+
             for m in candidates[:25]:
                 if m.id in open_market_ids:
                     continue
-                side = "YES" if m.yes_price <= m.no_price else "NO"
+                if len(open_rows) + opened_this_tick >= settings.POLYMARKET_MAX_OPEN_POSITIONS:
+                    break
+
+                # AI + candle + cheatsheet decision.
+                analysis = await analyze_polymarket(m)
+                action = (analysis.action or "SKIP").upper()
+                if action not in {"BUY_YES", "BUY_NO"}:
+                    continue
+                if analysis.score < settings.POLYMARKET_MIN_SCORE:
+                    continue
+
+                side = "YES" if action == "BUY_YES" else "NO"
                 entry = m.yes_price if side == "YES" else m.no_price
-                edge = max(0.0, 0.5 - entry)
-                score = int(round(min(99, 52 + edge * 90 + min(m.volume / 4000.0, 1.0) * 22)))
-                if self._is_micro_updown(m):
-                    score = min(99, score + 8)
+
                 risk = await check_polymarket_entry_risk(
-                    s, m, score=score, open_positions=len(open_rows)
+                    s, m, score=analysis.score, open_positions=len(open_rows) + opened_this_tick
                 )
                 if not risk.allow:
                     await self._log("INFO", f"polymarket risk blocked {m.id}: {risk.reason}", risk=risk.meta)
@@ -171,6 +183,10 @@ class PolymarketBot:
                     await self._log("INFO", f"polymarket canary blocked open: {canary_reason}", canary=canary_meta)
                     continue
                 await poly_wallet.debit(s, amount)
+                reasoning_blob = (
+                    f"asset={analysis.asset} interval={analysis.interval} "
+                    f"conf={analysis.confidence:.2f} {analysis.reasoning}"
+                )
                 t = PolyTrade(
                     market_id=m.id,
                     market_title=m.title,
@@ -179,20 +195,34 @@ class PolymarketBot:
                     entry_price=entry,
                     current_price=entry,
                     status="OPEN",
-                    agent_score=score,
-                    reasoning=f"phase1 paper signal; side={side}; edge={edge:.2f}; vol={m.volume:.0f}",
+                    agent_score=analysis.score,
+                    reasoning=reasoning_blob[:280],
                 )
                 s.add(t)
                 await s.commit()
+                opened_this_tick += 1
                 self.trades_today += 1
                 await bus.publish(
                     "polymarket:trade:opened",
-                    {"id": t.id, "market_id": t.market_id, "direction": t.direction, "entry_price": t.entry_price, "agent_score": t.agent_score},
+                    {
+                        "id": t.id,
+                        "market_id": t.market_id,
+                        "direction": t.direction,
+                        "entry_price": t.entry_price,
+                        "agent_score": t.agent_score,
+                        "asset": analysis.asset,
+                        "interval": analysis.interval,
+                    },
                 )
                 await bus.publish("polymarket:wallet:updated", {"balance": wallet.balance})
-                await self._log("INFO", f"polymarket opened {side} {m.id} @ {entry}")
-                # One new trade per tick to keep phase-1 controlled.
-                break
+                await self._log(
+                    "INFO",
+                    f"polymarket opened {side} {m.id} @ {entry} ({analysis.asset}/{analysis.interval}, score={analysis.score})",
+                )
+                # Refresh wallet snapshot so next iteration sees debited balance.
+                wallet = await poly_wallet.get_wallet(s)
+                if opened_this_tick >= max_per_tick:
+                    break
 
     @staticmethod
     def _is_micro_updown(m) -> bool:

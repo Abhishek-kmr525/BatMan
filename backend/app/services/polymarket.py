@@ -35,19 +35,62 @@ class PolymarketClient:
 
     async def get_markets(self, limit: int = 120) -> list[PolyMarket]:
         # Public Gamma API; fallback to mock markets if unavailable.
+        # We pull two slices: (1) imminent up/down markets in the next 2h,
+        # (2) general short-window markets ending in the next 24h.
+        # Both are sorted by endDate ascending so the closest-to-resolve
+        # markets land first in the candidate pool.
         try:
-            resp = await self._http.get(
+            now = datetime.now(timezone.utc)
+            soon = now + timedelta(hours=2)
+            day = now + timedelta(hours=24)
+            iso = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+
+            urgent = await self._http.get(
                 "https://gamma-api.polymarket.com/markets",
-                params={"closed": "false", "limit": limit},
+                params={
+                    "closed": "false",
+                    "active": "true",
+                    "limit": min(limit, 500),
+                    "order": "endDate",
+                    "ascending": "true",
+                    "end_date_min": iso(now),
+                    "end_date_max": iso(soon),
+                },
             )
-            resp.raise_for_status()
-            payload = resp.json()
-            if not isinstance(payload, list):
-                return _mock_markets(limit)
+            urgent.raise_for_status()
+            urgent_rows = urgent.json() if isinstance(urgent.json(), list) else []
+
+            broad = await self._http.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={
+                    "closed": "false",
+                    "active": "true",
+                    "limit": min(limit, 500),
+                    "order": "endDate",
+                    "ascending": "true",
+                    "end_date_min": iso(now),
+                    "end_date_max": iso(day),
+                },
+            )
+            broad_rows = broad.json() if broad.status_code == 200 and isinstance(broad.json(), list) else []
+
+            seen: set[str] = set()
             out: list[PolyMarket] = []
-            for row in payload[:limit]:
-                out.append(_parse_market(row))
-            return [m for m in out if m is not None]
+            for row in (urgent_rows + broad_rows):
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("id") or row.get("conditionId") or row.get("slug") or "")
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                m = _parse_market(row)
+                if m is not None:
+                    out.append(m)
+                if len(out) >= limit:
+                    break
+            if not out:
+                return _mock_markets(limit)
+            return out
         except Exception:
             return _mock_markets(limit)
 
@@ -67,7 +110,9 @@ def _parse_market(row: dict[str, Any]) -> PolyMarket | None:
         no = round(1 - yes, 4)
 
     volume = _safe_float(row.get("volume"), fallback=0.0)
-    end_ts = _parse_time(row.get("endDateIso") or row.get("endDate"))
+    # Prefer endDate (full ISO timestamp). endDateIso is just the date (no time)
+    # and parsing it gives midnight, which is wrong for intra-day 5m/15m markets.
+    end_ts = _parse_time(row.get("endDate") or row.get("endDateIso"))
     return PolyMarket(
         id=m_id,
         title=title,
