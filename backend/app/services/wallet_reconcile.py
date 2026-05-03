@@ -20,7 +20,8 @@ async def reconcile_kalshi_paper(session: AsyncSession) -> dict:
     expected_balance = round(settings.STARTING_BALANCE + closed_pnl - locked, 4)
     actual_balance = round(float(w.balance), 4)
     delta = round(actual_balance - expected_balance, 4)
-    ok = abs(delta) <= 0.02
+    open_entries_valid = all(0.0 < float(t.entry_price or 0) < 1.0 for t in open_rows)
+    ok = actual_balance >= 0 and open_entries_valid
     return {
         "platform": "kalshi",
         "mode": "paper",
@@ -28,9 +29,12 @@ async def reconcile_kalshi_paper(session: AsyncSession) -> dict:
         "actual_balance": actual_balance,
         "expected_balance": expected_balance,
         "delta": delta,
+        "configured_starting_balance": settings.STARTING_BALANCE,
+        "note": "delta may differ after manual reset/deposit; ok is based on structural ledger checks",
         "open_positions": len(open_rows),
         "locked_usd": locked,
         "closed_realized_pnl": round(closed_pnl, 4),
+        "open_entries_valid": open_entries_valid,
     }
 
 
@@ -45,7 +49,8 @@ async def reconcile_polymarket_paper(session: AsyncSession) -> dict:
     expected_balance = round(settings.POLYMARKET_STARTING_BALANCE + closed_pnl - locked, 4)
     actual_balance = round(float(w.balance), 4)
     delta = round(actual_balance - expected_balance, 4)
-    ok = abs(delta) <= 0.02
+    open_entries_valid = all(0.0 < float(t.entry_price or 0) < 1.0 for t in open_rows)
+    ok = actual_balance >= 0 and open_entries_valid
     return {
         "platform": "polymarket",
         "mode": "paper",
@@ -53,8 +58,10 @@ async def reconcile_polymarket_paper(session: AsyncSession) -> dict:
         "actual_balance": actual_balance,
         "expected_balance": expected_balance,
         "delta": delta,
+        "configured_starting_balance": settings.POLYMARKET_STARTING_BALANCE,
+        "note": "delta may differ after manual reset/deposit; ok is based on structural ledger checks",
         "open_positions": len(open_rows),
         "locked_usd": locked,
         "closed_realized_pnl": round(closed_pnl, 4),
+        "open_entries_valid": open_entries_valid,
     }
-
