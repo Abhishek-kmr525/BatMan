@@ -38,7 +38,7 @@ Edit `.env` at the repo root. Key flags:
 - `MIN_TRADE_SCORE`, `MAX_CONCURRENT_POSITIONS`, `BOT_SCAN_INTERVAL_SECONDS` — agent tuning.
 - `INTEL_FEATURES_ENABLED`, `INTEL_STRICT_SKIP` — enable/disable external intel gating.
 - `GUARDIAN_API_KEY` defaults to `test`; `FRED_API_KEY` is optional but required for FRED signals.
-- `QUICK_EXPIRY_ALWAYS_ON=true` with `QUICK_EXPIRY_MAX_SECONDS=600` forces the bot to trade only near-resolution markets (e.g. 10 minutes).
+- `QUICK_EXPIRY_ALWAYS_ON=true` with `QUICK_EXPIRY_MIN_SECONDS` and `QUICK_EXPIRY_MAX_SECONDS` constrains trading to a time window (e.g. 60..86400 seconds).
 
 ## API
 

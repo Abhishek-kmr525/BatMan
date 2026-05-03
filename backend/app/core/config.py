@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     INTEL_MIN_NEWS_ITEMS: int = 2
     INTEL_STRICT_SKIP: bool = True
     QUICK_EXPIRY_ALWAYS_ON: bool = False
+    QUICK_EXPIRY_MIN_SECONDS: int = 60
     QUICK_EXPIRY_MAX_SECONDS: int = 600
 
     BOT_SCAN_INTERVAL_SECONDS: int = 30
