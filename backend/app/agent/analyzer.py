@@ -171,14 +171,26 @@ def _local_skill_score(market: Market, chunks: list[dict], intel: dict | None = 
     intel_signal = _skill_external_intel(intel)
 
     entry = side_signal["entry"]
+
+    # --- Sports-aware gating: require >10pp model vs market deviation ---
+    sports_deviation_ok = True
+    if getattr(market, "category", None) == "Sports":
+        # Model's probability: use side_signal["entry"] as the bot's implied probability for the chosen side
+        # Market's probability: use yes_price or no_price depending on side
+        market_prob = market.yes_price if side_signal["side"] == "YES" else market.no_price
+        model_prob = side_signal["entry"]
+        deviation = abs(model_prob - market_prob)
+        sports_deviation_ok = deviation >= 0.10
+
+    # --- Re-weight scoring function ---
     score_raw = (
         18
-        + side_signal["score"] * 0.34
-        + liquidity["score"] * 0.18
-        + time_signal["score"] * 0.16
-        + clarity["score"] * 0.12
-        + knowledge_signal["score"] * 0.18
-        + intel_signal["score"] * 0.08
+        + side_signal["score"] * 0.10  # was 0.34, now 0.10
+        + liquidity["score"] * 0.14     # was 0.18, now 0.14
+        + time_signal["score"] * 0.14   # was 0.16, now 0.14
+        + clarity["score"] * 0.18       # was 0.12, now 0.18
+        + knowledge_signal["score"] * 0.26 # was 0.18, now 0.26
+        + intel_signal["score"] * 0.18     # was 0.08, now 0.18
     )
     score = int(round(_clamp(score_raw, 0.0, 99.0)))
 
@@ -224,6 +236,7 @@ def _local_skill_score(market: Market, chunks: list[dict], intel: dict | None = 
         and market.close_time_seconds >= 8 * 60
         and clarity["norm"] >= 0.35
         and not intel_signal["block_trade"]
+        and sports_deviation_ok
     )
 
     reason_parts = [
@@ -237,6 +250,8 @@ def _local_skill_score(market: Market, chunks: list[dict], intel: dict | None = 
         f"target {target:.2f} (+{tp_move:.2f})",
         f"stop {stop:.2f} (-{sl_move:.2f})",
     ]
+    if getattr(market, "category", None) == "Sports":
+        reason_parts.append(f"sports_deviation_ok={sports_deviation_ok}")
 
     return {
         "score": score,
