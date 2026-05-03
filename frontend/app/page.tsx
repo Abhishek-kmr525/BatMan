@@ -9,6 +9,9 @@ type Wallet = {
 };
 type BotStatus = {
   status: string; state: string; uptime_seconds: number; trades_today: number;
+  scanned_markets_today?: number;
+  last_scan_count?: number;
+  last_candidate_count?: number;
   active_positions?: number;
   max_concurrent_positions?: number;
 };
@@ -152,6 +155,8 @@ export default function Dashboard() {
 
   const running = bot?.status === "running";
   const pnl = wallet?.total_pnl ?? 0;
+  const openedToday = summary?.today_opened_count ?? bot?.trades_today ?? 0;
+  const scannedToday = bot?.scanned_markets_today ?? 0;
   const ranges: RangeLabel[] = ["This Week", "This Month", "This Year", "All Time"];
   const stats = ranges.map((r) => statForRange(r, closed));
 
@@ -313,7 +318,7 @@ export default function Dashboard() {
           </div>
           <div className="dashx-account-row">
             <span>Today</span>
-            <strong>{summary?.today_opened_count ?? bot?.trades_today ?? 0} opened</strong>
+            <strong>{openedToday} opened · {scannedToday} scanned</strong>
           </div>
         </div>
       </div>

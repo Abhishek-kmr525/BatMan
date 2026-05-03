@@ -21,6 +21,9 @@ class Bot:
         self.state: State = "STOPPED"
         self.started_at: datetime | None = None
         self.trades_today: int = 0
+        self.scanned_markets_today: int = 0
+        self.last_scan_count: int = 0
+        self.last_candidate_count: int = 0
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
@@ -34,6 +37,10 @@ class Bot:
         self._stop_event.clear()
         self.started_at = datetime.now(timezone.utc)
         self.state = "SCANNING"
+        self.trades_today = 0
+        self.scanned_markets_today = 0
+        self.last_scan_count = 0
+        self.last_candidate_count = 0
         self._task = asyncio.create_task(self._loop())
         await self._log("INFO", "bot started")
         await bus.publish("bot:status", self.status())
@@ -59,6 +66,9 @@ class Bot:
             "state": self.state,
             "uptime_seconds": uptime,
             "trades_today": self.trades_today,
+            "scanned_markets_today": self.scanned_markets_today,
+            "last_scan_count": self.last_scan_count,
+            "last_candidate_count": self.last_candidate_count,
             "started_at": self.started_at.isoformat() if self.started_at else None,
         }
 
@@ -121,6 +131,8 @@ class Bot:
             markets = [m for m in markets if m.volume >= 10]
             markets.sort(key=lambda m: m.volume, reverse=True)
             markets = markets[:120]
+        self.last_scan_count = len(markets)
+        self.scanned_markets_today += len(markets)
         await bus.publish("market:scan", {"count": len(markets)})
 
         active_list = strategies.get_active_list()
@@ -131,6 +143,7 @@ class Bot:
         if active_list:
             # Keep markets matched by ANY active strategy.
             candidates = [m for m in candidates if any(s.filter(m) for s in active_list)]
+        self.last_candidate_count = len(candidates)
         # Always sort by volume — most liquid first.
         candidates.sort(key=lambda m: m.volume, reverse=True)
 
