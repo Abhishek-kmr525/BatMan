@@ -200,7 +200,10 @@ class PolymarketBot:
         slug = str((m.raw or {}).get("slug") or "").lower()
         event_slug = str((((m.raw or {}).get("events") or [{}])[0].get("slug") or "")).lower()
         hay = f"{title} {slug} {event_slug}"
-        return ("up or down" in hay) or ("updown" in hay)
+        if not (("up or down" in hay) or ("updown" in hay)):
+            return False
+        # Focus only on short windows requested by user: 5m / 15m.
+        return any(tok in hay for tok in ("5m", "15m", "5 min", "15 min"))
 
 
 poly_bot = PolymarketBot()

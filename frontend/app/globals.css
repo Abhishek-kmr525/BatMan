@@ -286,3 +286,44 @@ input[type="number"], input[type="text"] {
     grid-column: auto;
   }
 }
+
+.poly-candles {
+  height: 260px;
+  border: 1px solid #1a2434;
+  border-radius: 8px;
+  padding: 10px 8px;
+  display: flex;
+  align-items: stretch;
+  gap: 3px;
+  background: #0f1420;
+  overflow: hidden;
+}
+
+.poly-candle-col {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 4px;
+}
+
+.poly-candle-wick {
+  position: absolute;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: #9eb2d8;
+}
+
+.poly-candle-body {
+  position: absolute;
+  left: 12%;
+  width: 76%;
+  border-radius: 2px;
+}
+
+.poly-candle-body.up {
+  background: #22c55e;
+}
+
+.poly-candle-body.down {
+  background: #ef4444;
+}

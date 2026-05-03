@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+import csv
+import io
+from datetime import datetime, timedelta, timezone
+import httpx
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -365,9 +369,50 @@ async def polymarket_markets(limit: int = 30):
             "no_price": m.no_price,
             "volume": m.volume,
             "time_to_close_seconds": m.close_time_seconds,
+            "slug": str((m.raw or {}).get("slug") or ""),
+            "event_slug": str((((m.raw or {}).get("events") or [{}])[0].get("slug") or "")),
         }
         for m in markets
     ]
+
+
+@router.get("/polymarket/candles")
+async def polymarket_candles(
+    interval: str = "5m",
+    limit: int = 80,
+    symbol: str = "BTCUSDT",
+):
+    interval = interval.lower().strip()
+    if interval not in {"5m", "15m"}:
+        raise HTTPException(status_code=400, detail="interval must be 5m or 15m")
+    limit = max(20, min(300, int(limit)))
+    sym = symbol.upper().strip()
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as h:
+            r = await h.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": sym, "interval": interval, "limit": limit},
+            )
+            r.raise_for_status()
+            rows = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"candle fetch failed: {e}")
+
+    out = []
+    for row in rows:
+        # Binance kline format:
+        # [openTime, open, high, low, close, volume, closeTime, ...]
+        out.append(
+            {
+                "t": int(row[0]),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
+            }
+        )
+    return {"symbol": sym, "interval": interval, "candles": out}
 
 
 # ---------- Agent ----------
@@ -484,6 +529,216 @@ async def risk_canary_status(session: AsyncSession = Depends(get_session)):
             },
         },
     }
+
+
+# ---------- Bots aggregate (Phase 5) ----------
+@router.get("/bots")
+async def bots_aggregate(session: AsyncSession = Depends(get_session)):
+    now = datetime.now(timezone.utc)
+    start_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+
+    k_active = int((await session.execute(
+        select(func.count(Trade.id)).where(Trade.status == "OPEN")
+    )).scalar_one() or 0)
+    k_today_opened = int((await session.execute(
+        select(func.count(Trade.id)).where(Trade.opened_at >= start_utc)
+    )).scalar_one() or 0)
+    k_today_pnl = float((await session.execute(
+        select(func.coalesce(func.sum(Trade.pnl), 0.0)).where(
+            Trade.closed_at.is_not(None), Trade.closed_at >= start_utc
+        )
+    )).scalar_one() or 0.0)
+    k_wallet = await wallet.get_wallet(session)
+    k_status = bot.status()
+
+    p_active = int((await session.execute(
+        select(func.count(PolyTrade.id)).where(PolyTrade.status == "OPEN")
+    )).scalar_one() or 0)
+    p_today_opened = int((await session.execute(
+        select(func.count(PolyTrade.id)).where(PolyTrade.opened_at >= start_utc)
+    )).scalar_one() or 0)
+    p_today_pnl = float((await session.execute(
+        select(func.coalesce(func.sum(PolyTrade.pnl), 0.0)).where(
+            PolyTrade.closed_at.is_not(None), PolyTrade.closed_at >= start_utc
+        )
+    )).scalar_one() or 0.0)
+    p_wallet = await poly_wallet.get_wallet(session)
+    p_status = poly_bot.status()
+
+    return {
+        "kalshi": {
+            "platform": "kalshi",
+            "status": k_status.get("status"),
+            "state": k_status.get("state"),
+            "uptime_seconds": k_status.get("uptime_seconds"),
+            "scanned_today": k_status.get("scanned_markets_today", 0),
+            "last_scan_count": k_status.get("last_scan_count", 0),
+            "last_candidate_count": k_status.get("last_candidate_count", 0),
+            "active_positions": k_active,
+            "max_concurrent_positions": settings.MAX_CONCURRENT_POSITIONS,
+            "today_opened": k_today_opened,
+            "today_pnl": round(k_today_pnl, 4),
+            "wallet": {
+                "balance": round(k_wallet.balance, 4),
+                "total_pnl": round(k_wallet.total_pnl, 4),
+                "total_trades": k_wallet.total_trades,
+                "wins": k_wallet.wins,
+                "losses": k_wallet.losses,
+            },
+            "mode_guard": mode_guard.get("kalshi").to_dict(),
+        },
+        "polymarket": {
+            "platform": "polymarket",
+            "status": p_status.get("status"),
+            "state": p_status.get("state"),
+            "uptime_seconds": p_status.get("uptime_seconds"),
+            "scanned_today": p_status.get("scanned_markets_today", 0),
+            "last_scan_count": p_status.get("last_scan_count", 0),
+            "last_candidate_count": p_status.get("last_candidate_count", 0),
+            "active_positions": p_active,
+            "max_concurrent_positions": settings.POLYMARKET_MAX_OPEN_POSITIONS,
+            "today_opened": p_today_opened,
+            "today_pnl": round(p_today_pnl, 4),
+            "wallet": {
+                "balance": round(p_wallet.balance, 4),
+                "total_pnl": round(p_wallet.total_pnl, 4),
+                "total_trades": p_wallet.total_trades,
+                "wins": p_wallet.wins,
+                "losses": p_wallet.losses,
+            },
+            "mode_guard": mode_guard.get("polymarket").to_dict(),
+        },
+        "combined": {
+            "today_pnl": round(k_today_pnl + p_today_pnl, 4),
+            "today_opened": k_today_opened + p_today_opened,
+            "active_positions": k_active + p_active,
+            "balance": round(k_wallet.balance + p_wallet.balance, 4),
+        },
+    }
+
+
+# ---------- Reports (Phase 5) ----------
+def _parse_date(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+@router.get("/reports/daily")
+async def reports_daily(
+    platform: str = "all",
+    days: int = 14,
+    session: AsyncSession = Depends(get_session),
+):
+    days = max(1, min(days, 90))
+    now = datetime.now(timezone.utc)
+    start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) - timedelta(days=days - 1)
+    platform = platform.lower()
+
+    series: dict[str, list[dict]] = {}
+
+    async def _build(model, label: str):
+        if platform not in {"all", label}:
+            return
+        rows = (await session.execute(
+            select(model.closed_at, model.pnl).where(
+                model.closed_at.is_not(None), model.closed_at >= start
+            )
+        )).all()
+        buckets: dict[str, dict[str, float]] = {}
+        for d in range(days):
+            day = (start + timedelta(days=d)).date().isoformat()
+            buckets[day] = {"date": day, "pnl": 0.0, "wins": 0, "losses": 0, "trades": 0}
+        for closed_at, pnl in rows:
+            if closed_at is None:
+                continue
+            key = closed_at.date().isoformat()
+            b = buckets.get(key)
+            if b is None:
+                continue
+            b["pnl"] += float(pnl or 0.0)
+            b["trades"] += 1
+            if (pnl or 0.0) > 0:
+                b["wins"] += 1
+            elif (pnl or 0.0) < 0:
+                b["losses"] += 1
+        out = []
+        for key in sorted(buckets):
+            b = buckets[key]
+            b["pnl"] = round(b["pnl"], 4)
+            out.append(b)
+        series[label] = out
+
+    await _build(Trade, "kalshi")
+    await _build(PolyTrade, "polymarket")
+
+    combined = []
+    if "kalshi" in series and "polymarket" in series:
+        k_idx = {r["date"]: r for r in series["kalshi"]}
+        for row in series["polymarket"]:
+            k = k_idx.get(row["date"], {"pnl": 0.0, "trades": 0, "wins": 0, "losses": 0})
+            combined.append({
+                "date": row["date"],
+                "pnl": round(row["pnl"] + k["pnl"], 4),
+                "trades": row["trades"] + k["trades"],
+                "wins": row["wins"] + k["wins"],
+                "losses": row["losses"] + k["losses"],
+            })
+
+    return {
+        "from": start.date().isoformat(),
+        "to": now.date().isoformat(),
+        "days": days,
+        "series": series,
+        "combined": combined,
+    }
+
+
+@router.get("/reports/export.csv")
+async def reports_export_csv(
+    platform: str = "all",
+    status: str = "all",
+    session: AsyncSession = Depends(get_session),
+):
+    platform = platform.lower()
+    status = status.lower()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        "platform", "id", "market_id", "market_title", "direction",
+        "amount", "entry_price", "exit_price", "pnl", "status",
+        "agent_score", "opened_at", "closed_at",
+    ])
+
+    async def _emit(model, label: str):
+        if platform not in {"all", label}:
+            return
+        q = select(model).order_by(desc(model.opened_at))
+        if status == "open":
+            q = q.where(model.status == "OPEN")
+        elif status == "closed":
+            q = q.where(model.status.like("CLOSED%"))
+        rows = (await session.execute(q)).scalars().all()
+        for t in rows:
+            w.writerow([
+                label, t.id, t.market_id, t.market_title, t.direction,
+                t.amount, t.entry_price, getattr(t, "exit_price", None),
+                t.pnl, t.status, t.agent_score,
+                t.opened_at.isoformat() if t.opened_at else "",
+                t.closed_at.isoformat() if t.closed_at else "",
+            ])
+
+    await _emit(Trade, "kalshi")
+    await _emit(PolyTrade, "polymarket")
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="amta_trades.csv"'},
+    )
 
 
 @router.get("/agent/logs")

@@ -49,6 +49,26 @@ type PolyTrade = {
   closed_at?: string | null;
 };
 
+type PolyMarket = {
+  id: string;
+  title: string;
+  yes_price: number;
+  no_price: number;
+  volume: number;
+  time_to_close_seconds: number;
+  slug: string;
+  event_slug: string;
+};
+
+type Candle = {
+  t: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
 type RangeLabel = "This Week" | "This Month" | "This Year" | "All Time";
 
 function inDays(d: Date, n: number) {
@@ -84,6 +104,9 @@ export default function PolymarketPage() {
   const [allTrades, setAllTrades] = useState<PolyTrade[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [markets, setMarkets] = useState<PolyMarket[]>([]);
+  const [interval, setIntervalLabel] = useState<"5m" | "15m">("5m");
+  const [candles, setCandles] = useState<Candle[]>([]);
 
   async function refresh() {
     try {
@@ -101,6 +124,14 @@ export default function PolymarketPage() {
       setOpenTrades(o);
       setClosedTrades(c);
       setAllTrades(a);
+      const mm = await api<PolyMarket[]>("/polymarket/markets?limit=120");
+      const filtered = mm.filter((m) => {
+        const hay = `${m.title} ${m.slug} ${m.event_slug}`.toLowerCase();
+        const isUpDown = hay.includes("up or down") || hay.includes("updown");
+        const isWantedWindow = hay.includes("5m") || hay.includes("15m") || hay.includes("5 min") || hay.includes("15 min");
+        return isUpDown && isWantedWindow;
+      });
+      setMarkets(filtered.slice(0, 30));
       setError(null);
     } catch (e: any) {
       setError(e?.message || "refresh failed");
@@ -147,6 +178,22 @@ export default function PolymarketPage() {
     const id = setInterval(() => void refresh(), 5000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    const loadCandles = async () => {
+      try {
+        const res = await api<{ symbol: string; interval: "5m" | "15m"; candles: Candle[] }>(
+          `/polymarket/candles?interval=${interval}&limit=80&symbol=BTCUSDT`
+        );
+        setCandles(res.candles || []);
+      } catch {
+        setCandles([]);
+      }
+    };
+    void loadCandles();
+    const id = setInterval(() => void loadCandles(), 15000);
+    return () => clearInterval(id);
+  }, [interval]);
 
   const ranges: RangeLabel[] = ["This Week", "This Month", "This Year", "All Time"];
   const stats = ranges.map((r) => statForRange(r, closedTrades));
@@ -268,6 +315,33 @@ export default function PolymarketPage() {
               </ResponsiveContainer>
             </div>
           </div>
+          <div className="card dashx-chart-card dashx-chart-wide">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <h3 style={{ margin: 0 }}>BTC Candles ({interval})</h3>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn btn-secondary" disabled={interval === "5m"} onClick={() => setIntervalLabel("5m")}>5m</button>
+                <button className="btn btn-secondary" disabled={interval === "15m"} onClick={() => setIntervalLabel("15m")}>15m</button>
+              </div>
+            </div>
+            <div className="poly-candles">
+              {candles.length === 0 && <div className="sub">No candle data.</div>}
+              {candles.map((c) => {
+                const up = c.close >= c.open;
+                const bodyLow = Math.min(c.open, c.close);
+                const bodyHigh = Math.max(c.open, c.close);
+                const range = Math.max(0.000001, c.high - c.low);
+                const wickTop = ((c.high - bodyHigh) / range) * 100;
+                const wickBottom = ((bodyLow - c.low) / range) * 100;
+                const bodyHeight = Math.max(1, ((bodyHigh - bodyLow) / range) * 100);
+                return (
+                  <div className="poly-candle-col" key={c.t}>
+                    <div className={`poly-candle-body ${up ? "up" : "down"}`} style={{ marginTop: `${wickTop}%`, height: `${bodyHeight}%` }} />
+                    <div className="poly-candle-wick" style={{ top: `${wickTop}%`, bottom: `${wickBottom}%` }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         </div>
 
         <div className="card dashx-side">
@@ -286,6 +360,44 @@ export default function PolymarketPage() {
             ))}
           </div>
         </div>
+      </div>
+
+      <div className="card" style={{ marginTop: 10 }}>
+        <h3 style={{ marginTop: 0 }}>Polymarket 5m/15m Focus Markets</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>YES</th>
+              <th>NO</th>
+              <th>Vol</th>
+              <th>Close In</th>
+              <th>Live</th>
+            </tr>
+          </thead>
+          <tbody>
+            {markets.length === 0 && (
+              <tr>
+                <td colSpan={6} className="sub">No 5m/15m up/down markets found right now.</td>
+              </tr>
+            )}
+            {markets.map((m) => {
+              const evt = m.event_slug || m.slug;
+              const href = evt ? `https://polymarket.com/event/${evt}` : "https://polymarket.com";
+              const mins = Math.max(0, Math.round((m.time_to_close_seconds || 0) / 60));
+              return (
+                <tr key={m.id}>
+                  <td title={m.title}>{m.title.slice(0, 80)}</td>
+                  <td>{m.yes_price.toFixed(3)}</td>
+                  <td>{m.no_price.toFixed(3)}</td>
+                  <td>{Math.round(m.volume).toLocaleString()}</td>
+                  <td>{mins}m</td>
+                  <td><a href={href} target="_blank" rel="noreferrer">Open</a></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
   );
