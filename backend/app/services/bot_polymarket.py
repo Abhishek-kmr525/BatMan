@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.db import SessionLocal
 from app.models.models import BotLog, PolyTrade
 from app.services.events import bus
+from app.services.mode_guard import mode_guard
 from app.services.polymarket import get_polymarket
 from app.services import poly_wallet
 from app.services.risk_engine import check_polymarket_entry_risk
@@ -143,6 +144,10 @@ class PolymarketBot:
                     break
 
                 self.state = "EXECUTING"
+                can_open, reason = mode_guard.can_open_new_trade("polymarket")
+                if not can_open:
+                    await self._log("INFO", f"polymarket mode guard blocked open: {reason}")
+                    continue
                 await poly_wallet.debit(s, amount)
                 t = PolyTrade(
                     market_id=m.id,

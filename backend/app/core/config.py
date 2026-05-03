@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     POLYMARKET_MAX_DAILY_LOSS_USD: float = 6.00
 
     KALSHI_MAX_DAILY_LOSS_USD: float = 15.00
+    KALSHI_LIVE_ENABLED: bool = False
+    POLYMARKET_LIVE_ENABLED: bool = False
+    LIVE_MODE_CONFIRM_PASSCODE: str = "9472"
 
     BOT_SCAN_INTERVAL_SECONDS: int = 30
     TRADE_AMOUNT_USD: float = 1.00

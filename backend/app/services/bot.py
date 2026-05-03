@@ -12,6 +12,7 @@ from app.models.models import BotLog
 from app.services import executor, strategies
 from app.services.events import bus
 from app.services.kalshi import get_kalshi
+from app.services.mode_guard import mode_guard
 from app.services.risk_engine import check_kalshi_entry_risk
 
 State = Literal["IDLE", "SCANNING", "ANALYZING", "EXECUTING", "MONITORING", "STOPPED"]
@@ -182,6 +183,10 @@ class Bot:
 
             self.state = "EXECUTING"
             async with SessionLocal() as s:
+                can_open, reason = mode_guard.can_open_new_trade("kalshi")
+                if not can_open:
+                    await self._log("INFO", f"kalshi mode guard blocked open: {reason}")
+                    continue
                 open_positions = await executor.open_count(s)
                 risk = await check_kalshi_entry_risk(
                     s, market, analysis, open_positions=open_positions

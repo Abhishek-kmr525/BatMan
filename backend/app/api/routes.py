@@ -22,6 +22,7 @@ from app.services.events import bus
 from app.services.intel import gather_market_intel
 from app.services.kalshi import get_kalshi
 from app.services.kalshi import Market
+from app.services.mode_guard import mode_guard
 from app.services.polymarket import get_polymarket
 from app.services.wallet_reconcile import reconcile_kalshi_paper, reconcile_polymarket_paper
 
@@ -52,6 +53,7 @@ async def bot_status(session: AsyncSession = Depends(get_session)):
     s = bot.status()
     s["active_positions"] = active
     s["max_concurrent_positions"] = settings.MAX_CONCURRENT_POSITIONS
+    s["mode_guard"] = mode_guard.get("kalshi").to_dict()
     return s
 
 
@@ -235,7 +237,70 @@ async def polymarket_bot_status(session: AsyncSession = Depends(get_session)):
     s = poly_bot.status()
     s["active_positions"] = active
     s["max_concurrent_positions"] = settings.POLYMARKET_MAX_OPEN_POSITIONS
+    s["mode_guard"] = mode_guard.get("polymarket").to_dict()
     return s
+
+
+class ModeRequestBody(BaseModel):
+    platform: str
+
+
+class ModeConfirmBody(BaseModel):
+    platform: str
+    passcode: str
+    limits: dict | None = None
+
+
+class KillSwitchBody(BaseModel):
+    platform: str
+    enabled: bool
+
+
+class ModeSetPaperBody(BaseModel):
+    platform: str
+
+
+@router.get("/mode/status")
+async def mode_status():
+    return mode_guard.snapshot()
+
+
+@router.post("/mode/request-live")
+async def mode_request_live(body: ModeRequestBody):
+    platform = body.platform.lower()
+    if platform not in {"kalshi", "polymarket"}:
+        raise HTTPException(status_code=400, detail="invalid platform")
+    result = mode_guard.request_live(platform)  # type: ignore[arg-type]
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "request failed"))
+    return result
+
+
+@router.post("/mode/confirm-live")
+async def mode_confirm_live(body: ModeConfirmBody):
+    platform = body.platform.lower()
+    if platform not in {"kalshi", "polymarket"}:
+        raise HTTPException(status_code=400, detail="invalid platform")
+    result = mode_guard.confirm_live(platform, body.passcode, body.limits)  # type: ignore[arg-type]
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "confirm failed"))
+    return result
+
+
+@router.post("/mode/set-paper")
+async def mode_set_paper(body: ModeSetPaperBody):
+    platform = body.platform.lower()
+    if platform not in {"kalshi", "polymarket"}:
+        raise HTTPException(status_code=400, detail="invalid platform")
+    return mode_guard.set_paper(platform)  # type: ignore[arg-type]
+
+
+@router.post("/mode/kill-switch")
+async def mode_kill_switch(body: KillSwitchBody):
+    platform = body.platform.lower()
+    if platform not in {"kalshi", "polymarket"}:
+        raise HTTPException(status_code=400, detail="invalid platform")
+    return mode_guard.set_kill_switch(platform, body.enabled)  # type: ignore[arg-type]
 
 
 @router.get("/polymarket/wallet")

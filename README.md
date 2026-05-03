@@ -41,6 +41,12 @@ Edit `.env` at the repo root. Key flags:
 - `QUICK_EXPIRY_ALWAYS_ON=true` with `QUICK_EXPIRY_MIN_SECONDS` and `QUICK_EXPIRY_MAX_SECONDS` constrains trading to a time window (e.g. 60..86400 seconds).
 - `POLYMARKET_*` variables control the separate phase-1 Polymarket paper bot (page: `/polymarket`).
 - Phase-2 safety APIs: `GET /api/risk/limits` and `GET /api/risk/reconcile` (paper wallet consistency + shared risk guard visibility).
+- Phase-3 arming APIs:
+  - `GET /api/mode/status`
+  - `POST /api/mode/request-live`
+  - `POST /api/mode/confirm-live`
+  - `POST /api/mode/set-paper`
+  - `POST /api/mode/kill-switch`
 
 ## API
 
