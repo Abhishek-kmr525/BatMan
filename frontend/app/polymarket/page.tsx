@@ -14,6 +14,10 @@ type PolyBotStatus = {
   last_candidate_count: number;
   active_positions: number;
   max_concurrent_positions: number;
+  mode_guard?: {
+    mode: string;
+    live_enabled: boolean;
+  };
 };
 
 type PolyWallet = {
@@ -183,6 +187,42 @@ export default function PolymarketPage() {
     }
   }
 
+  async function toggleMode() {
+    if (!bot?.mode_guard) return;
+    const current = bot.mode_guard.mode;
+    setBusy(true);
+    try {
+      if (current === "paper") {
+        await api("/mode/request-live", {
+          method: "POST",
+          body: JSON.stringify({ platform: "polymarket" }),
+        });
+        const pass = prompt("Enter Live Mode Passcode to Arm (9472):");
+        if (!pass) {
+          await api("/mode/set-paper", {
+            method: "POST",
+            body: JSON.stringify({ platform: "polymarket" }),
+          });
+        } else {
+          await api("/mode/confirm-live", {
+            method: "POST",
+            body: JSON.stringify({ platform: "polymarket", passcode: pass }),
+          });
+        }
+      } else {
+        await api("/mode/set-paper", {
+          method: "POST",
+          body: JSON.stringify({ platform: "polymarket" }),
+        });
+      }
+      await refresh();
+    } catch (e: any) {
+      alert("Mode toggle failed: " + e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   useEffect(() => {
     void refresh();
     const id = setInterval(() => void refresh(), 5000);
@@ -261,6 +301,16 @@ export default function PolymarketPage() {
           <div className="sub">Polymarket paper trading analytics</div>
         </div>
         <div className="dashx-actions">
+          {bot?.mode_guard && (
+            <button
+              className={`btn ${bot.mode_guard.mode === "live_armed" ? "btn-stop" : "btn-secondary"}`}
+              onClick={toggleMode}
+              disabled={busy || !bot.mode_guard.live_enabled}
+              title={!bot.mode_guard.live_enabled ? "Live mode disabled in config" : ""}
+            >
+              {bot.mode_guard.mode === "live_armed" ? "🔴 Live Armed" : "🟢 Paper Mode"}
+            </button>
+          )}
           {!running ? (
             <button className="btn btn-start" onClick={startBot} disabled={busy}>▶ Start Bot</button>
           ) : (

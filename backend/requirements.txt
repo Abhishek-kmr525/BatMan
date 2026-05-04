@@ -14,3 +14,4 @@ chromadb==0.5.13
 pypdf==5.0.1
 python-multipart==0.0.12
 websockets==13.1
+py-clob-client==0.34.6

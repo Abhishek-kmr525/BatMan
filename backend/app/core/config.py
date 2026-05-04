@@ -81,9 +81,13 @@ class Settings(BaseSettings):
     POLYMARKET_STARTING_BALANCE: float = 20.00
     POLYMARKET_MAX_DAILY_LOSS_USD: float = 6.00
 
+    POLYMARKET_PRIVATE_KEY: str = ""
+    POLYMARKET_HOST: str = "https://clob.polymarket.com"
+    POLYMARKET_CHAIN_ID: int = 137
+
     KALSHI_MAX_DAILY_LOSS_USD: float = 15.00
     KALSHI_LIVE_ENABLED: bool = False
-    POLYMARKET_LIVE_ENABLED: bool = False
+    POLYMARKET_LIVE_ENABLED: bool = True
     LIVE_MODE_CONFIRM_PASSCODE: str = "9472"
     LIVE_CANARY_ENABLED: bool = True
     KALSHI_CANARY_MAX_ORDER_USD: float = 2.00

@@ -27,6 +27,7 @@ from app.services.intel import gather_market_intel
 from app.services.kalshi import get_kalshi
 from app.services.kalshi import Market
 from app.services.mode_guard import mode_guard
+from app.services.poly_live import get_live_balance
 from app.services.polymarket import get_polymarket
 from app.services.wallet_reconcile import reconcile_kalshi_paper, reconcile_polymarket_paper
 from app.services.canary_guard import check_kalshi_canary, check_polymarket_canary
@@ -312,8 +313,13 @@ async def mode_kill_switch(body: KillSwitchBody):
 async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
     w = await poly_wallet.get_wallet(session)
     win_rate = (w.wins / w.total_trades * 100) if w.total_trades else 0.0
+    balance = w.balance
+    
+    if mode_guard.get("polymarket").mode == "live_armed":
+        balance = await get_live_balance()
+
     return {
-        "balance": round(w.balance, 4),
+        "balance": round(balance, 4),
         "total_pnl": round(w.total_pnl, 4),
         "total_trades": w.total_trades,
         "wins": w.wins,
@@ -592,6 +598,10 @@ async def bots_aggregate(session: AsyncSession = Depends(get_session)):
     )).scalar_one() or 0.0)
     p_wallet = await poly_wallet.get_wallet(session)
     p_status = poly_bot.status()
+    
+    p_balance = p_wallet.balance
+    if mode_guard.get("polymarket").mode == "live_armed":
+        p_balance = await get_live_balance()
 
     return {
         "kalshi": {
@@ -628,7 +638,7 @@ async def bots_aggregate(session: AsyncSession = Depends(get_session)):
             "today_opened": p_today_opened,
             "today_pnl": round(p_today_pnl, 4),
             "wallet": {
-                "balance": round(p_wallet.balance, 4),
+                "balance": round(p_balance, 4),
                 "total_pnl": round(p_wallet.total_pnl, 4),
                 "total_trades": p_wallet.total_trades,
                 "wins": p_wallet.wins,
@@ -640,7 +650,7 @@ async def bots_aggregate(session: AsyncSession = Depends(get_session)):
             "today_pnl": round(k_today_pnl + p_today_pnl, 4),
             "today_opened": k_today_opened + p_today_opened,
             "active_positions": k_active + p_active,
-            "balance": round(k_wallet.balance + p_wallet.balance, 4),
+            "balance": round(k_wallet.balance + p_balance, 4),
         },
     }
 

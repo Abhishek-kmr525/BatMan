@@ -16,6 +16,7 @@ from app.services.canary_guard import check_polymarket_canary
 from app.services.polymarket import get_polymarket
 from app.services import poly_wallet
 from app.services.poly_analyzer import analyze_polymarket
+from app.services.poly_live import place_live_order
 from app.services.risk_engine import check_polymarket_entry_risk
 
 State = Literal["IDLE", "SCANNING", "ANALYZING", "EXECUTING", "STOPPED"]
@@ -183,6 +184,31 @@ class PolymarketBot:
                 if not canary_ok:
                     await self._log("INFO", f"polymarket canary blocked open: {canary_reason}", canary=canary_meta)
                     continue
+
+                if mode == "live_armed":
+                    raw_tokens = m.raw.get("clobTokenIds")
+                    if isinstance(raw_tokens, str):
+                        import json
+                        try:
+                            raw_tokens = json.loads(raw_tokens)
+                        except Exception:
+                            raw_tokens = []
+                    
+                    if not raw_tokens or len(raw_tokens) < 2:
+                        await self._log("ERROR", f"polymarket live order blocked: missing clobTokenIds for {m.id}")
+                        continue
+                        
+                    token_id = raw_tokens[0] if side == "YES" else raw_tokens[1]
+                    # size is amount / price
+                    size = round(amount / entry, 2)
+                    
+                    live_res = await place_live_order(token_id=str(token_id), price=entry, size=size, side="BUY")
+                    if not live_res.get("ok"):
+                        await self._log("ERROR", f"polymarket live order failed: {live_res.get('error')}")
+                        continue
+                    
+                    await self._log("INFO", f"polymarket live order placed {m.id}: {live_res.get('orderID')}")
+
                 await poly_wallet.debit(s, amount)
                 reasoning_blob = (
                     f"asset={analysis.asset} interval={analysis.interval} "
@@ -274,6 +300,23 @@ class PolymarketBot:
                                 t.exit_price = cur
                                 t.pnl = pnl
                                 t.closed_at = datetime.now(timezone.utc)
+                                
+                                mode = mode_guard.get("polymarket").mode
+                                if mode == "live_armed":
+                                    raw_tokens = data.get("clobTokenIds")
+                                    if isinstance(raw_tokens, str):
+                                        import json
+                                        try:
+                                            raw_tokens = json.loads(raw_tokens)
+                                        except Exception:
+                                            raw_tokens = []
+                                    if raw_tokens and len(raw_tokens) >= 2:
+                                        token_id = raw_tokens[0] if t.direction == "YES" else raw_tokens[1]
+                                        size = round(t.amount / max(t.entry_price, 0.01), 2)
+                                        live_res = await place_live_order(token_id=str(token_id), price=cur, size=size, side="SELL")
+                                        if not live_res.get("ok"):
+                                            await self._log("ERROR", f"polymarket live tp exit failed: {live_res.get('error')}")
+
                                 await poly_wallet.credit(s, payout)
                                 await poly_wallet.record_close(s, pnl, pnl > 0)
                                 await s.commit()
