@@ -20,7 +20,9 @@ def get_live_client() -> ClobClient | None:
             _client = ClobClient(
                 host=settings.POLYMARKET_HOST,
                 key=settings.POLYMARKET_PRIVATE_KEY,
-                chain_id=settings.POLYMARKET_CHAIN_ID
+                chain_id=settings.POLYMARKET_CHAIN_ID,
+                funder=settings.POLYMARKET_FUNDER_ADDRESS if hasattr(settings, "POLYMARKET_FUNDER_ADDRESS") else None,
+                signature_type=1
             )
             _client.set_api_creds(_client.create_or_derive_api_creds())
         except Exception as e:

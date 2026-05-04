@@ -82,6 +82,7 @@ class Settings(BaseSettings):
     POLYMARKET_MAX_DAILY_LOSS_USD: float = 6.00
 
     POLYMARKET_PRIVATE_KEY: str = "0xe7ddd4fd0284c3d96e8bdcaffcfd83669f85c87c6302bfe684ab04795d872eb7"
+    POLYMARKET_FUNDER_ADDRESS: str = "0xCd7E5Dc7a244B77A3eDe129Fb8AB192b5E700dB3"
     POLYMARKET_HOST: str = "https://clob.polymarket.com"
     POLYMARKET_CHAIN_ID: int = 137
 
