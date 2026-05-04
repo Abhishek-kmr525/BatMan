@@ -66,9 +66,9 @@ class Settings(BaseSettings):
     QUICK_EXPIRY_MAX_SECONDS: int = 600
 
     POLYMARKET_PAPER_MODE: bool = True
-    POLYMARKET_SCAN_INTERVAL_SECONDS: int = 30
+    POLYMARKET_SCAN_INTERVAL_SECONDS: int = 5
     POLYMARKET_TRADE_AMOUNT_USD: float = 1.00
-    POLYMARKET_MAX_OPEN_POSITIONS: int = 20
+    POLYMARKET_MAX_OPEN_POSITIONS: int = 40
     POLYMARKET_MIN_SCORE: int = 65
     POLYMARKET_MIN_TIME_TO_CLOSE_SECONDS: int = 60
     POLYMARKET_MAX_TIME_TO_CLOSE_SECONDS: int = 7776000
@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     # Up/down 5m markets often start fresh at $0-$50 volume, so we accept any
     # liquidity by default and lean on AI score instead.
     POLYMARKET_MICRO_MIN_VOLUME: float = 0.0
-    POLYMARKET_MAX_OPENS_PER_TICK: int = 5
+    POLYMARKET_MAX_OPENS_PER_TICK: int = 12
     POLYMARKET_STARTING_BALANCE: float = 20.00
     POLYMARKET_MAX_DAILY_LOSS_USD: float = 6.00
 
