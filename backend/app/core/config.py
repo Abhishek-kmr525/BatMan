@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     # liquidity by default and lean on AI score instead.
     POLYMARKET_MICRO_MIN_VOLUME: float = 0.0
     POLYMARKET_MAX_OPENS_PER_TICK: int = 12
+    # Skip entries where the favorite is weaker than this — markets with the
+    # winning side priced below this floor are essentially coin flips and
+    # contributed ~67% of full losses in the last 200-trade window.
+    POLYMARKET_MIN_FAVORITE_PRICE: float = 0.60
     POLYMARKET_STARTING_BALANCE: float = 20.00
     POLYMARKET_MAX_DAILY_LOSS_USD: float = 6.00
 

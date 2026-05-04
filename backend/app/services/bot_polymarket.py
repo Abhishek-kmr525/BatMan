@@ -162,6 +162,10 @@ class PolymarketBot:
                 side = "YES" if action == "BUY_YES" else "NO"
                 entry = m.yes_price if side == "YES" else m.no_price
 
+                # Skip weak favorites — coin-flip markets dominate full losses.
+                if entry < settings.POLYMARKET_MIN_FAVORITE_PRICE:
+                    continue
+
                 risk = await check_polymarket_entry_risk(
                     s, m, score=analysis.score, open_positions=len(open_rows) + opened_this_tick
                 )
