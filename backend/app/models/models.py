@@ -34,6 +34,7 @@ class Trade(Base):
     reasoning: Mapped[str] = mapped_column(Text, default="")
     strategy_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     source: Mapped[str] = mapped_column(String(16), default="bot")  # bot | quick_trade
+    mode: Mapped[str] = mapped_column(String(20), default="paper", index=True)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -84,6 +85,7 @@ class PolyTrade(Base):
     status: Mapped[str] = mapped_column(String(20), default="OPEN", index=True)
     agent_score: Mapped[int] = mapped_column(Integer, default=0)
     reasoning: Mapped[str] = mapped_column(Text, default="")
+    mode: Mapped[str] = mapped_column(String(20), default="paper", index=True)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

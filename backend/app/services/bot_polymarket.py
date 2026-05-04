@@ -224,6 +224,7 @@ class PolymarketBot:
                     status="OPEN",
                     agent_score=analysis.score,
                     reasoning=reasoning_blob[:280],
+                    mode="live" if mode == "live_armed" else "paper",
                 )
                 s.add(t)
                 await s.commit()

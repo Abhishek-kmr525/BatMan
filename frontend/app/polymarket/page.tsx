@@ -27,6 +27,7 @@ type PolyWallet = {
   wins: number;
   losses: number;
   win_rate: number;
+  live_error?: string | null;
 };
 
 type PolySummary = {
@@ -406,7 +407,14 @@ export default function PolymarketPage() {
         <div className="card dashx-account">
           <div className="dashx-account-row">
             <span>Account Balance</span>
-            <strong className="pos">${wallet ? wallet.balance.toFixed(2) : "—"}</strong>
+            <div style={{ textAlign: "right" }}>
+              <strong className="pos">${wallet ? wallet.balance.toFixed(2) : "—"}</strong>
+              {wallet?.live_error && (
+                <div className="sub" style={{ color: "#ff7b7b", fontSize: "11px", marginTop: "2px" }}>
+                  {wallet.live_error}
+                </div>
+              )}
+            </div>
           </div>
           <div className="dashx-account-row">
             <span>Total P&L</span>

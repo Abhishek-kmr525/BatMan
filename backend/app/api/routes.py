@@ -314,9 +314,15 @@ async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
     w = await poly_wallet.get_wallet(session)
     win_rate = (w.wins / w.total_trades * 100) if w.total_trades else 0.0
     balance = w.balance
+    live_error = None
     
     if mode_guard.get("polymarket").mode == "live_armed":
-        balance = await get_live_balance()
+        from app.services.poly_live import get_live_client
+        if get_live_client() is None:
+            live_error = "Missing or invalid POLYMARKET_PRIVATE_KEY"
+            balance = 0.0
+        else:
+            balance = await get_live_balance()
 
     return {
         "balance": round(balance, 4),
@@ -325,6 +331,7 @@ async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
         "wins": w.wins,
         "losses": w.losses,
         "win_rate": round(win_rate, 2),
+        "live_error": live_error,
     }
 
 
@@ -335,7 +342,8 @@ async def polymarket_trades(
     page: int = 1,
     session: AsyncSession = Depends(get_session),
 ):
-    q = select(PolyTrade)
+    current_mode = "live" if mode_guard.get("polymarket").mode == "live_armed" else "paper"
+    q = select(PolyTrade).where(PolyTrade.mode == current_mode)
     if status == "open":
         q = q.where(PolyTrade.status == "OPEN")
     elif status == "closed":
@@ -349,11 +357,12 @@ async def polymarket_trades(
 async def polymarket_trades_summary(session: AsyncSession = Depends(get_session)):
     now = datetime.now(timezone.utc)
     start_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    total = int((await session.execute(select(func.count(PolyTrade.id)))).scalar_one() or 0)
-    open_count = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.status == "OPEN"))).scalar_one() or 0)
-    closed_count = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.status.like("CLOSED%")))).scalar_one() or 0)
-    today_opened = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.opened_at >= start_utc))).scalar_one() or 0)
-    today_closed = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.closed_at.is_not(None), PolyTrade.closed_at >= start_utc))).scalar_one() or 0)
+    current_mode = "live" if mode_guard.get("polymarket").mode == "live_armed" else "paper"
+    total = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode))).scalar_one() or 0)
+    open_count = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.status == "OPEN"))).scalar_one() or 0)
+    closed_count = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.status.like("CLOSED%")))).scalar_one() or 0)
+    today_opened = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.opened_at >= start_utc))).scalar_one() or 0)
+    today_closed = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.closed_at.is_not(None), PolyTrade.closed_at >= start_utc))).scalar_one() or 0)
     return {
         "total_count": total,
         "open_count": open_count,
