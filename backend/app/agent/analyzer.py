@@ -106,13 +106,13 @@ def _build_user_prompt_with_intel(market: Market, chunks: list[dict], intel: dic
 
 
 def _favorite_side_analysis(market: Market) -> Analysis:
-    """Deterministic: buy the favorite (higher-priced side = lower payout)."""
+    """Deterministic: buy the lower-priced (cheaper) side per user spec."""
     yes = market.yes_price
     no = market.no_price
-    side = "YES" if yes >= no else "NO"
+    side = "YES" if yes <= no else "NO"
     entry = yes if side == "YES" else no
-    target = round(min(0.99, entry + 0.05), 2)
-    stop = round(max(0.01, entry - 0.20), 2)
+    target = round(min(0.99, entry + 0.10), 2)
+    stop = round(max(0.01, entry - 0.10), 2)
     return Analysis(
         score=99,
         action=f"BUY_{side}",
@@ -120,9 +120,9 @@ def _favorite_side_analysis(market: Market) -> Analysis:
         entry_price=entry,
         target_exit_price=target,
         stop_loss_price=stop,
-        reasoning=f"favorite-mode: BUY {side} @ {entry:.2f} (yes={yes:.2f}, no={no:.2f})",
+        reasoning=f"min-price-mode: BUY {side} @ {entry:.2f} (yes={yes:.2f}, no={no:.2f})",
         knowledge_sources=[],
-        raw={"mode": "favorite", "yes": yes, "no": no},
+        raw={"mode": "min_price", "yes": yes, "no": no},
     )
 
 
