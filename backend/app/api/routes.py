@@ -238,7 +238,10 @@ async def polymarket_bot_stop():
 
 @router.get("/polymarket/bot/status")
 async def polymarket_bot_status(session: AsyncSession = Depends(get_session)):
-    res = await session.execute(select(PolyTrade).where(PolyTrade.status == "OPEN"))
+    current_mode = "live" if mode_guard.get("polymarket").mode == "live_armed" else "paper"
+    res = await session.execute(
+        select(PolyTrade).where(PolyTrade.status == "OPEN", PolyTrade.mode == current_mode)
+    )
     active = len(list(res.scalars().all()))
     s = poly_bot.status()
     s["active_positions"] = active
@@ -311,25 +314,41 @@ async def mode_kill_switch(body: KillSwitchBody):
 
 @router.get("/polymarket/wallet")
 async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
-    w = await poly_wallet.get_wallet(session)
-    win_rate = (w.wins / w.total_trades * 100) if w.total_trades else 0.0
-    balance = w.balance
+    is_live = mode_guard.get("polymarket").mode == "live_armed"
+    current_mode = "live" if is_live else "paper"
     live_error = None
-    
-    if mode_guard.get("polymarket").mode == "live_armed":
+
+    # Stats are always scoped to the current mode so live and paper don't bleed
+    # into each other. Paper balance still comes from the simulated wallet
+    # table; live balance comes from the on-chain CLOB call.
+    if is_live:
         from app.services.poly_live import get_live_client
         if get_live_client() is None:
             live_error = "Missing or invalid POLYMARKET_PRIVATE_KEY"
             balance = 0.0
         else:
             balance = await get_live_balance()
+    else:
+        w = await poly_wallet.get_wallet(session)
+        balance = w.balance
+
+    closed_q = select(PolyTrade).where(
+        PolyTrade.mode == current_mode,
+        PolyTrade.status.like("CLOSED%"),
+    )
+    closed = (await session.execute(closed_q)).scalars().all()
+    total_pnl = float(sum((t.pnl or 0.0) for t in closed))
+    wins = sum(1 for t in closed if (t.pnl or 0.0) > 0)
+    losses = sum(1 for t in closed if (t.pnl or 0.0) < 0)
+    total_trades = len(closed)
+    win_rate = (wins / total_trades * 100) if total_trades else 0.0
 
     return {
         "balance": round(balance, 4),
-        "total_pnl": round(w.total_pnl, 4),
-        "total_trades": w.total_trades,
-        "wins": w.wins,
-        "losses": w.losses,
+        "total_pnl": round(total_pnl, 4),
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
         "win_rate": round(win_rate, 2),
         "live_error": live_error,
     }
