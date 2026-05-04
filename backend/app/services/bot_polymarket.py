@@ -250,6 +250,42 @@ class PolymarketBot:
                 closed = data.get("closed", False)
                 active = data.get("active", True)
                 
+                if (not closed) and active:
+                    raw_live = data.get("outcomePrices")
+                    if isinstance(raw_live, str):
+                        import json as _json_live
+                        try:
+                            raw_live = _json_live.loads(raw_live)
+                        except Exception:
+                            raw_live = None
+                    if isinstance(raw_live, list) and len(raw_live) >= 2:
+                        try:
+                            cur_yes = float(raw_live[0])
+                            cur_no = float(raw_live[1])
+                        except (TypeError, ValueError):
+                            cur_yes = cur_no = None
+                        if cur_yes is not None and t.entry_price and t.entry_price > 0:
+                            cur = cur_yes if t.direction == "YES" else cur_no
+                            if cur >= t.entry_price * 1.15:
+                                contracts = t.amount / max(t.entry_price, 0.01)
+                                payout = contracts * cur
+                                pnl = round(payout - t.amount, 4)
+                                t.status = "CLOSED_TAKE_PROFIT"
+                                t.exit_price = cur
+                                t.pnl = pnl
+                                t.closed_at = datetime.now(timezone.utc)
+                                await poly_wallet.credit(s, payout)
+                                await poly_wallet.record_close(s, pnl, pnl > 0)
+                                await s.commit()
+                                await self._log(
+                                    "INFO",
+                                    f"polymarket TP+15% closed {t.id} entry={t.entry_price:.3f} exit={cur:.3f} pnl={pnl:.3f}",
+                                )
+                                await bus.publish("polymarket:trade:closed", {"id": t.id, "pnl": pnl})
+                                w = await poly_wallet.get_wallet(s)
+                                await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
+                                continue
+
                 if closed or not active:
                     raw_outcomes = data.get("outcomePrices")
                     if isinstance(raw_outcomes, str):
@@ -258,7 +294,7 @@ class PolymarketBot:
                             raw_outcomes = json.loads(raw_outcomes)
                         except Exception:
                             pass
-                            
+
                     if isinstance(raw_outcomes, list) and len(raw_outcomes) >= 2:
                         val_yes = str(raw_outcomes[0]).strip()
                         val_no = str(raw_outcomes[1]).strip()

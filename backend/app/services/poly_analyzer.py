@@ -356,6 +356,21 @@ def _strip_fence(s: str) -> str:
 # ---------- Public entry ----------
 
 async def analyze_polymarket(market: PolyMarket) -> PolyAnalysis:
+    if settings.BYPASS_ANALYZER_BUY_FAVORITE:
+        yes = market.yes_price
+        no = market.no_price
+        side = "YES" if yes <= no else "NO"
+        entry = yes if side == "YES" else no
+        return PolyAnalysis(
+            score=99,
+            action=f"BUY_{side}",
+            confidence=0.99,
+            entry_price=entry,
+            reasoning=f"min-price-mode: BUY {side} @ {entry:.2f} (yes={yes:.2f}, no={no:.2f})",
+            knowledge_sources=[],
+            features={"mode": "min_price", "yes": yes, "no": no},
+        )
+
     asset, interval = detect_asset_and_interval(market)
     candles: list[dict] = []
     candle_source = "none"
