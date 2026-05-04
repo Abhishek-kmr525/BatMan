@@ -69,7 +69,7 @@ type Candle = {
   volume: number;
 };
 
-type RangeLabel = "This Week" | "This Month" | "This Year" | "All Time";
+type RangeLabel = "Today" | "This Week" | "This Month" | "This Year" | "All Time";
 
 function inDays(d: Date, n: number) {
   return Date.now() - d.getTime() <= n * 24 * 60 * 60 * 1000;
@@ -79,9 +79,19 @@ function fmtCurrency(n: number) {
   return `${n >= 0 ? "+" : "-"}$${Math.abs(n).toFixed(2)}`;
 }
 
+function isSameLocalDay(a: Date, b: Date) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
 function statForRange(label: RangeLabel, closed: PolyTrade[]) {
+  const today = new Date();
   const filtered = closed.filter((t) => {
     const dt = new Date(t.closed_at || t.opened_at);
+    if (label === "Today") return isSameLocalDay(dt, today);
     if (label === "This Week") return inDays(dt, 7);
     if (label === "This Month") return inDays(dt, 30);
     if (label === "This Year") return inDays(dt, 365);
@@ -195,8 +205,11 @@ export default function PolymarketPage() {
     return () => clearInterval(id);
   }, [interval]);
 
-  const ranges: RangeLabel[] = ["This Week", "This Month", "This Year", "All Time"];
+  const ranges: RangeLabel[] = ["Today", "This Week", "This Month", "This Year", "All Time"];
   const stats = ranges.map((r) => statForRange(r, closedTrades));
+  const last30 = statForRange("This Month", closedTrades);
+  const candidateCount = bot?.last_candidate_count ?? 0;
+  const winRatePct = wallet?.win_rate ?? 0;
 
   const balanceSeries = (() => {
     if (!wallet) return [] as { t: string; balance: number }[];
@@ -263,6 +276,67 @@ export default function PolymarketPage() {
           Live refresh issue: {error}
         </div>
       )}
+
+      <div className="dashx-hero-row">
+        <div className="card dashx-hero">
+          <div className="dashx-hero-head">
+            <div className="dashx-hero-icon hero-green" aria-hidden>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12a7 7 0 0 1 14 0"/><path d="M8.5 12a3.5 3.5 0 0 1 7 0"/><circle cx="12" cy="12" r="1"/></svg>
+            </div>
+            <span className={`dashx-hero-badge ${running ? "ok" : "muted"}`}>
+              <span className="dot"/>{running ? "Live" : "Idle"}
+            </span>
+          </div>
+          <div className="dashx-hero-label">Active Signals</div>
+          <div className="dashx-hero-value">
+            {bot?.active_positions ?? 0}
+            <span className="dashx-hero-delta pos">+{summary?.today_opened_count ?? 0} today</span>
+          </div>
+        </div>
+
+        <div className="card dashx-hero">
+          <div className="dashx-hero-head">
+            <div className="dashx-hero-icon hero-blue" aria-hidden>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg>
+            </div>
+            <span className="dashx-hero-trend pos">↗ {wallet ? wallet.wins : 0}W</span>
+          </div>
+          <div className="dashx-hero-label">Win Rate</div>
+          <div className="dashx-hero-value">{winRatePct.toFixed(1)}%</div>
+          <div className="dashx-hero-bar">
+            <div className="dashx-hero-bar-fill" style={{ width: `${Math.min(100, Math.max(0, winRatePct))}%` }} />
+          </div>
+        </div>
+
+        <div className="card dashx-hero">
+          <div className="dashx-hero-head">
+            <div className="dashx-hero-icon hero-violet" aria-hidden>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="14 7 21 7 21 14"/></svg>
+            </div>
+            <span className={`dashx-hero-trend ${last30.pnl >= 0 ? "pos" : "neg"}`}>
+              ↗ {last30.total} trades
+            </span>
+          </div>
+          <div className="dashx-hero-label">Total Profit (30d)</div>
+          <div className={`dashx-hero-value gradient ${last30.pnl < 0 ? "neg-gradient" : ""}`}>
+            {last30.pnl >= 0 ? "+" : "-"}${Math.abs(last30.pnl).toFixed(2)}
+          </div>
+        </div>
+
+        <div className="card dashx-hero">
+          <div className="dashx-hero-head">
+            <div className="dashx-hero-icon hero-amber" aria-hidden>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+            </div>
+            <span className="dashx-hero-badge pending"><span className="dot"/>Pending</span>
+          </div>
+          <div className="dashx-hero-label">Pending Signals</div>
+          <div className="dashx-hero-value">
+            {candidateCount}
+            <span className="dashx-hero-delta muted">awaiting execution</span>
+          </div>
+        </div>
+      </div>
 
       <div className="dashx-grid-top">
         {stats.map((s) => (
