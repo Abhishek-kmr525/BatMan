@@ -37,6 +37,9 @@ class Settings(BaseSettings):
 
     ANALYZER_PROVIDER: str = "local"  # "local" | "claude"
     LOCAL_ANALYZER_USE_RAG: bool = False
+    # When True, skip all scoring and deterministically BUY the favorite side
+    # (the higher-priced contract = lower payout = portal's recommendation).
+    BYPASS_ANALYZER_BUY_FAVORITE: bool = True
     GEMINI_REVIEW_ENABLED: bool = False
     GEMINI_MODEL: str = "gemini-2.5-flash"
     GEMINI_REVIEW_MIN_SCORE: int = 85

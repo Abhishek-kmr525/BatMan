@@ -105,7 +105,31 @@ def _build_user_prompt_with_intel(market: Market, chunks: list[dict], intel: dic
     return f"{base}\n\nEXTERNAL_INTEL:\n{intel_json}\n\nReturn JSON only."
 
 
+def _favorite_side_analysis(market: Market) -> Analysis:
+    """Deterministic: buy the favorite (higher-priced side = lower payout)."""
+    yes = market.yes_price
+    no = market.no_price
+    side = "YES" if yes >= no else "NO"
+    entry = yes if side == "YES" else no
+    target = round(min(0.99, entry + 0.05), 2)
+    stop = round(max(0.01, entry - 0.20), 2)
+    return Analysis(
+        score=99,
+        action=f"BUY_{side}",
+        confidence=0.99,
+        entry_price=entry,
+        target_exit_price=target,
+        stop_loss_price=stop,
+        reasoning=f"favorite-mode: BUY {side} @ {entry:.2f} (yes={yes:.2f}, no={no:.2f})",
+        knowledge_sources=[],
+        raw={"mode": "favorite", "yes": yes, "no": no},
+    )
+
+
 async def analyze_market(market: Market) -> Analysis:
+    if settings.BYPASS_ANALYZER_BUY_FAVORITE:
+        return _favorite_side_analysis(market)
+
     rag_query = f"Kalshi {market.category} market: {market.title}"
     intel = await gather_market_intel(market)
     intel_dict = intel.as_dict()
