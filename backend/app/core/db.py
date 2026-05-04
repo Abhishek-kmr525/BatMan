@@ -1,6 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
+from sqlalchemy import text
 from app.core.config import normalize_db_url, settings
 
 
@@ -16,6 +17,14 @@ async def init_db() -> None:
     from app.models import models  # noqa: F401  ensure mappers registered
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        try:
+            await conn.execute(text("ALTER TABLE trades ADD COLUMN mode VARCHAR(20) DEFAULT 'paper'"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE poly_trades ADD COLUMN mode VARCHAR(20) DEFAULT 'paper'"))
+        except Exception:
+            pass
     async with SessionLocal() as session:
         from app.services.wallet import ensure_wallet_initialized
         from app.services.poly_wallet import ensure_wallet_initialized as ensure_poly_wallet_initialized
