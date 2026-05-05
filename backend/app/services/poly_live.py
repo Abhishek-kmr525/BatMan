@@ -150,4 +150,7 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
             return {"ok": False, "error": str(resp.get("errorMsg", "unknown error"))}
     except Exception as e:
         logger.error(f"Failed to place live polymarket order: {e}")
+        # if it's PolyApiException, print more details
+        if hasattr(e, "status_code"):
+            logger.error(f"PolyApiException status={e.status_code} error={getattr(e, 'error_msg', getattr(e, 'error_message', str(e)))}")
         return {"ok": False, "error": str(e)}

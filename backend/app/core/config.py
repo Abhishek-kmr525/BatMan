@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     POLYMARKET_MIN_FAVORITE_PRICE: float = 0.60
     # 0 = EOA, 1 = POLY_PROXY (Magic email login), 2 = POLY_GNOSIS_SAFE (browser wallet).
     # Browser-wallet accounts (MetaMask etc.) need 2; Magic accounts need 1.
-    POLYMARKET_SIGNATURE_TYPE: int = 1
+    POLYMARKET_SIGNATURE_TYPE: int = 2
     POLYMARKET_STARTING_BALANCE: float = 20.00
     POLYMARKET_MAX_DAILY_LOSS_USD: float = 6.00
 
