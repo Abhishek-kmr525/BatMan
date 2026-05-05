@@ -144,13 +144,79 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
             options=PartialCreateOrderOptions(neg_risk=neg_risk),
         )
         resp = client.post_order(signed_order)
+
         if resp.get("success"):
             return {"ok": True, "orderID": resp.get("orderID")}
         else:
-            return {"ok": False, "error": str(resp.get("errorMsg", "unknown error"))}
+            err_msg = str(resp.get("errorMsg", "unknown error"))
+            logger.error(f"Order failed with sig_type {client.builder.signature_type}: {err_msg}")
+            
+            # If it failed due to signature or maker issues, try falling back dynamically
+            if "order_version_mismatch" in err_msg or "maker address not allowed" in err_msg:
+                return _fallback_order_placement(client, order_args, neg_risk)
+
+            return {"ok": False, "error": err_msg}
+
     except Exception as e:
         logger.error(f"Failed to place live polymarket order: {e}")
         # if it's PolyApiException, print more details
+        err_msg = str(e)
         if hasattr(e, "status_code"):
-            logger.error(f"PolyApiException status={e.status_code} error={getattr(e, 'error_msg', getattr(e, 'error_message', str(e)))}")
-        return {"ok": False, "error": str(e)}
+            err_msg = str(getattr(e, 'error_msg', getattr(e, 'error_message', str(e))))
+            logger.error(f"PolyApiException status={e.status_code} error={err_msg}")
+            
+            # Auto-fallback logic
+            if "order_version_mismatch" in err_msg or "maker address not allowed" in err_msg:
+                return _fallback_order_placement(client, order_args, neg_risk)
+
+        return {"ok": False, "error": err_msg}
+
+def _fallback_order_placement(original_client, order_args, neg_risk):
+    logger.info("Attempting auto-fallback for signature_type and funder...")
+    try:
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import PartialCreateOrderOptions
+        import copy
+        
+        # We try these configurations (funder, signature_type)
+        original_funder = original_client.builder.funder
+        configs_to_try = [
+            (original_funder, 2),  # Try Gnosis Safe
+            (original_funder, 1),  # Try Magic Proxy
+            (None, 0),             # Try raw EOA
+            (None, 2),             # Try EOA with Gnosis Safe
+            (None, 1),             # Try EOA with Magic Proxy
+        ]
+        
+        for funder, sig_type in configs_to_try:
+            if funder == original_funder and sig_type == original_client.builder.signature_type:
+                continue # Already tried
+                
+            logger.info(f"Fallback attempt: funder={funder}, sig_type={sig_type}")
+            try:
+                fallback_client = ClobClient(
+                    host=original_client.host,
+                    key=original_client.builder.signer.private_key,
+                    chain_id=original_client.chain_id,
+                    funder=funder,
+                    signature_type=sig_type,
+                )
+                fallback_client.set_api_creds(original_client.creds)
+                
+                signed_order = fallback_client.create_order(
+                    order_args,
+                    options=PartialCreateOrderOptions(neg_risk=neg_risk),
+                )
+                resp = fallback_client.post_order(signed_order)
+                if resp.get("success"):
+                    logger.info(f"Fallback SUCCESS! funder={funder}, sig_type={sig_type}")
+                    return {"ok": True, "orderID": resp.get("orderID")}
+            except Exception as fe:
+                err_str = str(getattr(fe, 'error_msg', getattr(fe, 'error_message', str(fe))))
+                logger.debug(f"Fallback failed for {funder}/{sig_type}: {err_str}")
+                continue
+                
+        return {"ok": False, "error": "All signature fallbacks failed."}
+    except Exception as e:
+        logger.error(f"Fallback process crashed: {e}")
+        return {"ok": False, "error": "Fallback logic failed."}
