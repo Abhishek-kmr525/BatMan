@@ -92,6 +92,14 @@ class Settings(BaseSettings):
     POLYMARKET_FUNDER_ADDRESS: str = "0xCd7E5Dc7a244B77A3eDe129Fb8AB192b5E700dB3"
     POLYMARKET_HOST: str = "https://clob.polymarket.com"
     POLYMARKET_CHAIN_ID: int = 137
+    # Optional outbound proxy for Polymarket CLOB calls only. Set to an HTTPS
+    # or SOCKS5 URL whose exit IP is in an allowed region to bypass geo-blocks
+    # on the Railway egress IP. Examples:
+    #   https://user:pass@proxy.example.com:8443
+    #   socks5://user:pass@proxy.example.com:1080
+    # Leave empty to use the direct path. Only the v2 ClobClient HTTP traffic
+    # is routed through it; OpenAI, Gamma, and other outbound calls are not.
+    POLYMARKET_PROXY_URL: str = ""
 
     KALSHI_MAX_DAILY_LOSS_USD: float = 15.00
     KALSHI_LIVE_ENABLED: bool = False

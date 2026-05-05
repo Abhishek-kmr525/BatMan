@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import logging
+import httpx
+from py_clob_client_v2 import http_helpers as _v2_http_helpers
+from py_clob_client_v2.http_helpers import helpers as _v2_helpers_mod
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import (
     BalanceAllowanceParams,
@@ -16,11 +19,45 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 _client: ClobClient | None = None
+_proxy_installed: bool = False
+
+
+def _install_proxy_if_configured() -> None:
+    """Route only Polymarket CLOB traffic through a configured outbound proxy.
+
+    The v2 SDK uses a module-level `httpx.Client` for all CLOB calls. Replacing
+    it here keeps OpenAI, Gamma, and other outbound traffic on the direct path
+    while sending CLOB requests through a proxy in an allowed region — needed
+    when the host's egress IP is geo-blocked by Polymarket.
+    """
+    global _proxy_installed
+    if _proxy_installed:
+        return
+    proxy_url = getattr(settings, "POLYMARKET_PROXY_URL", "") or ""
+    if not proxy_url:
+        return
+    try:
+        new_client = httpx.Client(http2=True, proxy=proxy_url, timeout=30.0)
+        old_client = getattr(_v2_helpers_mod, "_http_client", None)
+        _v2_helpers_mod._http_client = new_client
+        if old_client is not None:
+            try:
+                old_client.close()
+            except Exception:
+                pass
+        _proxy_installed = True
+        logger.info(
+            f"Polymarket CLOB HTTP client routed via proxy "
+            f"{proxy_url.split('@')[-1]}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to install Polymarket proxy: {e}")
 
 def get_live_client() -> ClobClient | None:
     global _client
     if not settings.POLYMARKET_PRIVATE_KEY:
         return None
+    _install_proxy_if_configured()
     if _client is None:
         try:
             sig_type = int(getattr(settings, "POLYMARKET_SIGNATURE_TYPE", 2))
