@@ -61,11 +61,14 @@ def get_live_client() -> ClobClient | None:
     if _client is None:
         try:
             sig_type = int(getattr(settings, "POLYMARKET_SIGNATURE_TYPE", 2))
+            is_eoa = settings.POLYMARKET_SIGNER_ADDRESS.lower() == settings.POLYMARKET_WALLET_ADDRESS.lower()
+            funder_addr = None if is_eoa else (settings.POLYMARKET_FUNDER_ADDRESS if hasattr(settings, "POLYMARKET_FUNDER_ADDRESS") else None)
+
             _client = ClobClient(
                 host=settings.POLYMARKET_HOST,
                 key=settings.POLYMARKET_PRIVATE_KEY,
                 chain_id=settings.POLYMARKET_CHAIN_ID,
-                funder=settings.POLYMARKET_FUNDER_ADDRESS if hasattr(settings, "POLYMARKET_FUNDER_ADDRESS") else None,
+                funder=funder_addr,
                 signature_type=sig_type,
             )
             logger.info(f"Polymarket ClobClient initialised (signature_type={sig_type})")
