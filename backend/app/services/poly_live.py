@@ -151,6 +151,15 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
             order_args,
             options=PartialCreateOrderOptions(neg_risk=neg_risk),
         )
+
+        msg = f"POLY_LIVE_DEBUG_ORDER: sig_type={client.builder.signature_type}, funder={client.builder.funder}, version={client._ClobClient__cached_version}"
+        logger.info(msg)
+        from app.core.database import SessionLocal
+        from app.models.trade import LogEntry
+        with SessionLocal() as db:
+            db.add(LogEntry(level="INFO", message=msg, metadata_json={"platform": "polymarket"}))
+            db.commit()
+
         resp = client.post_order(signed_order)
         if resp.get("success"):
             return {"ok": True, "orderID": resp.get("orderID")}
