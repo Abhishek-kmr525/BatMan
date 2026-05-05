@@ -60,9 +60,12 @@ def get_live_client() -> ClobClient | None:
     _install_proxy_if_configured()
     if _client is None:
         try:
+            import os
             sig_type = int(getattr(settings, "POLYMARKET_SIGNATURE_TYPE", 2))
-            is_eoa = settings.POLYMARKET_SIGNER_ADDRESS.lower() == settings.POLYMARKET_WALLET_ADDRESS.lower()
-            funder_addr = None if is_eoa else (settings.POLYMARKET_FUNDER_ADDRESS if hasattr(settings, "POLYMARKET_FUNDER_ADDRESS") else None)
+            signer = getattr(settings, "POLYMARKET_SIGNER_ADDRESS", None) or os.getenv("POLYMARKET_SIGNER_ADDRESS", "")
+            wallet = getattr(settings, "POLYMARKET_WALLET_ADDRESS", None) or os.getenv("POLYMARKET_WALLET_ADDRESS", "")
+            is_eoa = bool(signer and wallet and signer.lower() == wallet.lower())
+            funder_addr = None if is_eoa else getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
 
             _client = ClobClient(
                 host=settings.POLYMARKET_HOST,
