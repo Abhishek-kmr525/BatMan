@@ -34,7 +34,8 @@ def _install_proxy_if_configured() -> None:
     if _proxy_installed:
         return
     proxy_url = getattr(settings, "POLYMARKET_PROXY_URL", "") or ""
-    if not proxy_url:
+    host_url = getattr(settings, "POLYMARKET_HOST", "") or ""
+    if not proxy_url or "trycloudflare.com" in host_url:
         return
     try:
         new_client = httpx.Client(http2=True, proxy=proxy_url, timeout=30.0)
