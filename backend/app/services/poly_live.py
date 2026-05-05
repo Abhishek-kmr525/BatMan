@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import logging
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import BalanceAllowanceParams, AssetType, OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
+    BalanceAllowanceParams,
+    AssetType,
+    OrderArgs,
+    OrderType,
+    PartialCreateOrderOptions,
+)
+from py_clob_client_v2.order_builder.constants import BUY
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -17,14 +23,20 @@ def get_live_client() -> ClobClient | None:
         return None
     if _client is None:
         try:
+            sig_type = int(getattr(settings, "POLYMARKET_SIGNATURE_TYPE", 2))
             _client = ClobClient(
                 host=settings.POLYMARKET_HOST,
                 key=settings.POLYMARKET_PRIVATE_KEY,
                 chain_id=settings.POLYMARKET_CHAIN_ID,
                 funder=settings.POLYMARKET_FUNDER_ADDRESS if hasattr(settings, "POLYMARKET_FUNDER_ADDRESS") else None,
-                signature_type=1
+                signature_type=sig_type,
             )
-            _client.set_api_creds(_client.create_or_derive_api_creds())
+            logger.info(f"Polymarket ClobClient initialised (signature_type={sig_type})")
+            try:
+                creds = _client.create_api_key()
+            except Exception:
+                creds = _client.derive_api_key()
+            _client.set_api_creds(creds)
         except Exception as e:
             logger.error(f"Failed to init Polymarket ClobClient: {e}")
             return None
@@ -57,14 +69,36 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
     if not client:
         return {"ok": False, "error": "live client not initialized"}
     try:
+        # Polymarket Up/Down crypto markets are negRisk. The CLOB order
+        # typehash differs between standard and negRisk markets — the wrong
+        # one fails with HTTP 400 order_version_mismatch. Detect per token.
+        try:
+            neg_risk = bool(client.get_neg_risk(token_id))
+        except Exception as e:
+            logger.warning(f"get_neg_risk failed for {token_id}: {e}; assuming False")
+            neg_risk = False
+
+        # tick_size also varies (0.01, 0.001, 0.0001). Round price to the
+        # market's tick to avoid signature-mismatch rejections on the price
+        # field. Default to 0.01 if lookup fails.
+        try:
+            tick_size = float(client.get_tick_size(token_id))
+        except Exception as e:
+            logger.warning(f"get_tick_size failed for {token_id}: {e}; using 0.01")
+            tick_size = 0.01
+        if tick_size > 0:
+            price = round(round(price / tick_size) * tick_size, 6)
+
         order_args = OrderArgs(
             price=price,
             size=size,
-            side=BUY if side.upper() == "BUY" else "SELL", # Note: using string or enum
+            side=BUY if side.upper() == "BUY" else "SELL",
             token_id=token_id,
         )
-        # In py_clob_client side is usually 'BUY' or 'SELL'.
-        signed_order = client.create_order(order_args)
+        signed_order = client.create_order(
+            order_args,
+            options=PartialCreateOrderOptions(neg_risk=neg_risk),
+        )
         resp = client.post_order(signed_order)
         if resp.get("success"):
             return {"ok": True, "orderID": resp.get("orderID")}
