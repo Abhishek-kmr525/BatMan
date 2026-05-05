@@ -68,6 +68,8 @@ def get_live_client() -> ClobClient | None:
             is_eoa = bool(signer and wallet and signer.lower() == wallet.lower())
             funder_addr = None if is_eoa else getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
 
+            logger.info(f"POLY_LIVE_DEBUG: sig_type={sig_type}, is_eoa={is_eoa}, signer={signer}, wallet={wallet}, funder_addr={funder_addr}")
+
             _client = ClobClient(
                 host=settings.POLYMARKET_HOST,
                 key=settings.POLYMARKET_PRIVATE_KEY,
