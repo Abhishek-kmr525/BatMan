@@ -27,7 +27,7 @@ from app.services.intel import gather_market_intel
 from app.services.kalshi import get_kalshi
 from app.services.kalshi import Market
 from app.services.mode_guard import mode_guard
-from app.services.poly_live import get_live_balance
+from app.services.poly_live import get_live_balance, get_live_balance_error
 from app.services.polymarket import get_polymarket
 from app.services.wallet_reconcile import reconcile_kalshi_paper, reconcile_polymarket_paper
 from app.services.canary_guard import check_kalshi_canary, check_polymarket_canary
@@ -328,6 +328,9 @@ async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
             balance = 0.0
         else:
             balance = await get_live_balance()
+            bal_err = get_live_balance_error()
+            if bal_err:
+                live_error = bal_err
     else:
         w = await poly_wallet.get_wallet(session)
         balance = w.balance
@@ -351,6 +354,24 @@ async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
         "losses": losses,
         "win_rate": round(win_rate, 2),
         "live_error": live_error,
+    }
+
+
+@router.get("/polymarket/live/health")
+async def polymarket_live_health():
+    """Quick connectivity check for the live CLOB client."""
+    from app.services.poly_live import get_live_client, get_live_balance_error
+    client = get_live_client()
+    if client is None:
+        return {"ok": False, "error": "ClobClient not initialised — check POLYMARKET_PRIVATE_KEY"}
+    balance = await get_live_balance()
+    err = get_live_balance_error()
+    return {
+        "ok": not bool(err),
+        "balance": balance,
+        "error": err or None,
+        "funder": getattr(getattr(client, "builder", None), "funder", None),
+        "sig_type": getattr(getattr(client, "builder", None), "signature_type", None),
     }
 
 

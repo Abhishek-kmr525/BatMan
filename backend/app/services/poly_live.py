@@ -66,7 +66,18 @@ def get_live_client() -> ClobClient | None:
             signer = getattr(settings, "POLYMARKET_SIGNER_ADDRESS", None) or os.getenv("POLYMARKET_SIGNER_ADDRESS", "")
             wallet = getattr(settings, "POLYMARKET_WALLET_ADDRESS", None) or os.getenv("POLYMARKET_WALLET_ADDRESS", "")
             is_eoa = bool(signer and wallet and signer.lower() == wallet.lower())
-            funder_addr = None if is_eoa else getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
+            # For Gnosis Safe (sig_type=2) the funder must be the Safe address.
+            # Prefer explicit POLYMARKET_FUNDER_ADDRESS; fall back to
+            # POLYMARKET_WALLET_ADDRESS (which IS the Safe address when the
+            # signer ≠ wallet, i.e. the relayer key signs on behalf of the Safe).
+            if is_eoa:
+                funder_addr = None
+            else:
+                funder_addr = (
+                    getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
+                    or getattr(settings, "POLYMARKET_WALLET_ADDRESS", None)
+                    or os.getenv("POLYMARKET_WALLET_ADDRESS", "")
+                ) or None
 
             _client = ClobClient(
                 host=settings.POLYMARKET_HOST,
@@ -86,21 +97,34 @@ def get_live_client() -> ClobClient | None:
             return None
     return _client
 
+_last_balance_error: str = ""
+
+
 async def get_live_balance() -> float:
+    """Return live USDC balance, or 0.0 on failure (error stored in get_live_balance_error())."""
+    global _last_balance_error
+    _last_balance_error = ""
     client = get_live_client()
     if not client:
+        _last_balance_error = "ClobClient not initialised — check POLYMARKET_PRIVATE_KEY"
         return 0.0
     try:
         res = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-        # The balance is returned in raw USDC atomic units (6 decimals). 
-        # But wait, Polymarket returns it as a string representing the exact atomic units?
-        # Let's check format. It returned '0'. If 1 USDC = 1000000, we need to divide by 1e6.
-        # py_clob_client converts or not? Let's assume we divide by 1e6.
+        # Balance returned as raw USDC atomic units (6 decimals); divide by 1e6.
         raw_bal = float(res.get("balance", 0))
         return raw_bal / 1e6
     except Exception as e:
-        logger.error(f"Failed to fetch live polymarket balance: {e}")
+        err_msg = str(getattr(e, "error_msg", getattr(e, "error_message", str(e))))
+        if hasattr(e, "status_code"):
+            err_msg = f"HTTP {e.status_code}: {err_msg}"
+        _last_balance_error = err_msg
+        logger.error(f"Failed to fetch live polymarket balance: {err_msg}")
         return 0.0
+
+
+def get_live_balance_error() -> str:
+    """Return the last error string from get_live_balance(), or empty string if OK."""
+    return _last_balance_error
 
 async def place_live_order(token_id: str, price: float, size: float, side: str) -> dict:
     """
