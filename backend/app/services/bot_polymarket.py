@@ -175,8 +175,22 @@ class PolymarketBot:
                 side = "YES" if action == "BUY_YES" else "NO"
                 entry = m.yes_price if side == "YES" else m.no_price
 
-                # Skip weak favorites — coin-flip markets dominate full losses.
-                if entry < settings.POLYMARKET_MIN_FAVORITE_PRICE:
+                # In paper mode / MODE-B (balance >= $5): skip weak favorites —
+                # coin-flip markets dominate full losses when following AI side.
+                # In MODE-A (balance < $5) we intentionally bet the underdog so
+                # the favourite-price filter does NOT apply (the cheap side will
+                # be re-selected below after the live-mode block is reached).
+                _is_live = mode_guard.get("polymarket").mode == "live_armed"
+                _live_bal_for_filter = _live_clob_balance if _is_live else None
+                _skip_fav_filter = _is_live and (
+                    _live_bal_for_filter is None or _live_bal_for_filter < 5.0
+                )
+                if not _skip_fav_filter and entry < settings.POLYMARKET_MIN_FAVORITE_PRICE:
+                    await self._log(
+                        "INFO",
+                        f"polymarket skip {m.id}: AI side {side}@{entry:.3f} "
+                        f"< min_favorite {settings.POLYMARKET_MIN_FAVORITE_PRICE:.2f}",
+                    )
                     continue
 
                 risk = await check_polymarket_entry_risk(
@@ -186,7 +200,9 @@ class PolymarketBot:
                     await self._log("INFO", f"polymarket risk blocked {m.id}: {risk.reason}", risk=risk.meta)
                     continue
                 amount = settings.POLYMARKET_TRADE_AMOUNT_USD
-                if wallet.balance < amount:
+                # Paper-mode wallet guard (live mode checks effective_amount after
+                # MODE-A/B sizing is computed further below).
+                if not _is_live and wallet.balance < amount:
                     break
 
                 self.state = "EXECUTING"
@@ -275,9 +291,9 @@ class PolymarketBot:
                     token_id = raw_tokens[0] if live_side == "YES" else raw_tokens[1]
 
                     # Guard: CLOB on-chain balance must cover the order.
-                    # Use a tiny 1-cent buffer — the returned balance is already
-                    # the free/available amount, so no large cushion is needed.
-                    if balance_known and effective_amount > _live_clob_balance - 0.01:
+                    # No cushion — the returned free balance is already net of
+                    # locked funds, so a straight comparison is correct.
+                    if balance_known and effective_amount > _live_clob_balance:
                         await self._log(
                             "INFO",
                             f"polymarket live skip {m.id}: CLOB balance "
