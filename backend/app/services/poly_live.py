@@ -256,15 +256,32 @@ def _fallback_order_placement(original_client, order_args, neg_risk):
                 resp = fallback_client.post_order(signed_order)
                 if resp.get("success"):
                     logger.info(f"Fallback SUCCESS! funder={funder}, sig_type={sig_type}")
-                    # Update module-level client so future orders use the working config.
+                    # Persist working config for future orders.
                     global _client
                     _client = fallback_client
                     return {"ok": True, "orderID": resp.get("orderID")}
+                err_body = str(resp.get("errorMsg", resp))
+                logger.info(f"Fallback ({funder}/{sig_type}) post: {err_body[:120]}")
+                return {"ok": False, "error": err_body}
             except Exception as fe:
                 err_str = str(getattr(fe, "error_msg", getattr(fe, "error_message", str(fe))))
-                logger.info(f"Fallback ({funder}/{sig_type}) → {err_str[:80]}")
+                logger.info(f"Fallback ({funder}/{sig_type}) exc → {err_str[:120]}")
+
+                # This config passed signature validation — persist it and
+                # surface the real error (balance, size) so the bot can act.
+                non_sig_errors = (
+                    "not enough balance", "lower than the minimum",
+                    "insufficient", "no liquidity",
+                )
+                if any(kw in err_str for kw in non_sig_errors):
+                    global _client
+                    _client = fallback_client
+                    logger.info(
+                        f"Persisting working sig config: funder={funder}, sig_type={sig_type}"
+                    )
+                    return {"ok": False, "error": err_str}
                 continue
-                
+
         return {"ok": False, "error": "All signature fallbacks failed."}
     except Exception as e:
         logger.error(f"Fallback process crashed: {e}")

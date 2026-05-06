@@ -203,15 +203,30 @@ class PolymarketBot:
                         continue
                         
                     token_id = raw_tokens[0] if side == "YES" else raw_tokens[1]
-                    # size is amount / price
-                    size = round(amount / entry, 2)
-                    
+                    # Polymarket CLOB enforces a minimum of 5 contracts per order.
+                    # Ensure size >= 5; scale amount up if needed.
+                    CLOB_MIN_SIZE = 5.0
+                    raw_size = amount / max(entry, 0.001)
+                    size = max(raw_size, CLOB_MIN_SIZE)
+                    effective_amount = round(size * entry, 4)
+                    size = round(size, 2)
+
+                    if wallet.balance < effective_amount:
+                        await self._log(
+                            "INFO",
+                            f"polymarket live skip {m.id}: wallet ${wallet.balance:.2f} < "
+                            f"min order ${effective_amount:.2f} (size={size}@{entry})",
+                        )
+                        continue
+
                     live_res = await place_live_order(token_id=str(token_id), price=entry, size=size, side="BUY")
                     if not live_res.get("ok"):
                         await self._log("ERROR", f"polymarket live order failed: {live_res.get('error')}")
                         continue
-                    
+
                     await self._log("INFO", f"polymarket live order placed {m.id}: {live_res.get('orderID')}")
+                    # Use the effective amount for wallet accounting.
+                    amount = effective_amount
 
                 await poly_wallet.debit(s, amount)
                 reasoning_blob = (
