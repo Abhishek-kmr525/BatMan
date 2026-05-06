@@ -275,7 +275,9 @@ class PolymarketBot:
                     token_id = raw_tokens[0] if live_side == "YES" else raw_tokens[1]
 
                     # Guard: CLOB on-chain balance must cover the order.
-                    if balance_known and effective_amount > _live_clob_balance - 0.05:
+                    # Use a tiny 1-cent buffer — the returned balance is already
+                    # the free/available amount, so no large cushion is needed.
+                    if balance_known and effective_amount > _live_clob_balance - 0.01:
                         await self._log(
                             "INFO",
                             f"polymarket live skip {m.id}: CLOB balance "
