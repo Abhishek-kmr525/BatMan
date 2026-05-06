@@ -183,13 +183,20 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
 
     except Exception as e:
         logger.error(f"Failed to place live polymarket order: {e}")
-        # if it's PolyApiException, print more details
         err_msg = str(e)
         if hasattr(e, "status_code"):
-            err_msg = str(getattr(e, 'error_msg', getattr(e, 'error_message', str(e))))
+            err_msg = str(getattr(e, "error_msg", getattr(e, "error_message", str(e))))
             logger.error(f"PolyApiException status={e.status_code} error={err_msg}")
-            
-            # Auto-fallback logic
+
+            # Geo-block — no fallback will help; surface a clear message.
+            if e.status_code == 403 and "Trading restricted" in str(err_msg):
+                return {
+                    "ok": False,
+                    "error": "GEO_BLOCKED: Railway's US IP is blocked by Polymarket. "
+                             "Set POLYMARKET_PROXY_URL in Railway env to a proxy in an allowed region.",
+                }
+
+            # Signature or maker mismatch — try sig-type fallbacks.
             if "order_version_mismatch" in err_msg or "maker address not allowed" in err_msg:
                 return _fallback_order_placement(client, order_args, neg_risk)
 
