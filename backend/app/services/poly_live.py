@@ -12,6 +12,7 @@ from py_clob_client_v2.clob_types import (
     OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
+    ApiCreds,
 )
 from py_clob_client_v2.order_builder.constants import BUY
 from app.core.config import settings
@@ -66,9 +67,6 @@ def get_live_client() -> ClobClient | None:
             # working (sig_type, funder) and we lock it in via env vars so it
             # survives redeploys without needing another sweep.
             sig_type = int(getattr(settings, "POLYMARKET_SIGNATURE_TYPE", 0))
-            # Prefer explicit POLYMARKET_FUNDER_ADDRESS (set by operator after
-            # the fallback sweeper confirms the working config). If not set,
-            # fall back to wallet address for Gnosis Safe accounts.
             explicit_funder = (
                 getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
                 or os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
@@ -89,10 +87,36 @@ def get_live_client() -> ClobClient | None:
                 f"Polymarket ClobClient initialised "
                 f"(signature_type={sig_type}, funder={funder_addr})"
             )
-            try:
-                creds = _client.create_api_key()
-            except Exception:
-                creds = _client.derive_api_key()
+
+            # Prefer pre-existing API creds from env (required for proxy/Magic
+            # wallet accounts where create_api_key fails without a browser session).
+            api_key = (
+                getattr(settings, "POLYMARKET_API_KEY", None)
+                or os.getenv("POLYMARKET_API_KEY", "")
+            ) or ""
+            api_secret = (
+                getattr(settings, "POLYMARKET_API_SECRET", None)
+                or os.getenv("POLYMARKET_API_SECRET", "")
+            ) or ""
+            api_passphrase = (
+                getattr(settings, "POLYMARKET_API_PASSPHRASE", None)
+                or os.getenv("POLYMARKET_API_PASSPHRASE", "")
+            ) or ""
+
+            if api_key and api_secret and api_passphrase:
+                creds = ApiCreds(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    api_passphrase=api_passphrase,
+                )
+                logger.info("Using pre-existing API creds from env (POLYMARKET_API_KEY/SECRET/PASSPHRASE)")
+            else:
+                # Derive creds from private key (works for EOA sig_type=0 accounts).
+                try:
+                    creds = _client.create_api_key()
+                except Exception:
+                    creds = _client.derive_api_key()
+                logger.info("Derived API creds from private key")
             _client.set_api_creds(creds)
         except Exception as e:
             logger.error(f"Failed to init Polymarket ClobClient: {e}")
