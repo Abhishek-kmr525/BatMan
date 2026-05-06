@@ -62,22 +62,21 @@ def get_live_client() -> ClobClient | None:
     if _client is None:
         try:
             import os
-            sig_type = int(getattr(settings, "POLYMARKET_SIGNATURE_TYPE", 2))
-            signer = getattr(settings, "POLYMARKET_SIGNER_ADDRESS", None) or os.getenv("POLYMARKET_SIGNER_ADDRESS", "")
-            wallet = getattr(settings, "POLYMARKET_WALLET_ADDRESS", None) or os.getenv("POLYMARKET_WALLET_ADDRESS", "")
-            is_eoa = bool(signer and wallet and signer.lower() == wallet.lower())
-            # For Gnosis Safe (sig_type=2) the funder must be the Safe address.
-            # Prefer explicit POLYMARKET_FUNDER_ADDRESS; fall back to
-            # POLYMARKET_WALLET_ADDRESS (which IS the Safe address when the
-            # signer ≠ wallet, i.e. the relayer key signs on behalf of the Safe).
-            if is_eoa:
-                funder_addr = None
-            else:
-                funder_addr = (
-                    getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
-                    or getattr(settings, "POLYMARKET_WALLET_ADDRESS", None)
-                    or os.getenv("POLYMARKET_WALLET_ADDRESS", "")
-                ) or None
+            # Always use explicit env config — the fallback sweeper discovers the
+            # working (sig_type, funder) and we lock it in via env vars so it
+            # survives redeploys without needing another sweep.
+            sig_type = int(getattr(settings, "POLYMARKET_SIGNATURE_TYPE", 0))
+            # Prefer explicit POLYMARKET_FUNDER_ADDRESS (set by operator after
+            # the fallback sweeper confirms the working config). If not set,
+            # fall back to wallet address for Gnosis Safe accounts.
+            explicit_funder = (
+                getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
+                or os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
+            ) or None
+            funder_addr = explicit_funder or (
+                (getattr(settings, "POLYMARKET_WALLET_ADDRESS", None)
+                 or os.getenv("POLYMARKET_WALLET_ADDRESS", "")) or None
+            ) if sig_type != 0 else explicit_funder
 
             _client = ClobClient(
                 host=settings.POLYMARKET_HOST,
@@ -86,7 +85,10 @@ def get_live_client() -> ClobClient | None:
                 funder=funder_addr,
                 signature_type=sig_type,
             )
-            logger.info(f"Polymarket ClobClient initialised (signature_type={sig_type})")
+            logger.info(
+                f"Polymarket ClobClient initialised "
+                f"(signature_type={sig_type}, funder={funder_addr})"
+            )
             try:
                 creds = _client.create_api_key()
             except Exception:
