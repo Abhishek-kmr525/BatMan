@@ -211,6 +211,7 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
         return {"ok": False, "error": err_msg}
 
 def _fallback_order_placement(original_client, order_args, neg_risk):
+    global _client  # declare once at top so inner assignments don't trigger SyntaxError
     logger.info("Attempting auto-fallback for signature_type and funder...")
     try:
         from py_clob_client_v2.client import ClobClient
@@ -256,9 +257,7 @@ def _fallback_order_placement(original_client, order_args, neg_risk):
                 resp = fallback_client.post_order(signed_order)
                 if resp.get("success"):
                     logger.info(f"Fallback SUCCESS! funder={funder}, sig_type={sig_type}")
-                    # Persist working config for future orders.
-                    global _client
-                    _client = fallback_client
+                    _client = fallback_client  # persist working config
                     return {"ok": True, "orderID": resp.get("orderID")}
                 err_body = str(resp.get("errorMsg", resp))
                 logger.info(f"Fallback ({funder}/{sig_type}) post: {err_body[:120]}")
@@ -274,8 +273,7 @@ def _fallback_order_placement(original_client, order_args, neg_risk):
                     "insufficient", "no liquidity",
                 )
                 if any(kw in err_str for kw in non_sig_errors):
-                    global _client
-                    _client = fallback_client
+                    _client = fallback_client  # persist working sig config
                     logger.info(
                         f"Persisting working sig config: funder={funder}, sig_type={sig_type}"
                     )
