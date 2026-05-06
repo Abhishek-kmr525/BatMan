@@ -142,6 +142,19 @@ class PolymarketBot:
             open_market_ids = {t.market_id for t in open_rows}
             wallet = await poly_wallet.get_wallet(s)
 
+            # Fetch live CLOB balance once per tick to guard against placing
+            # orders that will fail due to insufficient on-chain funds.
+            _current_mode = mode_guard.get("polymarket").mode
+            _live_clob_balance: float | None = None
+            if _current_mode == "live_armed":
+                from app.services.poly_live import get_live_balance
+                _live_clob_balance = await get_live_balance()
+                if _live_clob_balance is not None:
+                    await self._log(
+                        "INFO",
+                        f"polymarket live CLOB balance: ${_live_clob_balance:.4f}",
+                    )
+
             opened_this_tick = 0
             max_per_tick = max(1, getattr(settings, "POLYMARKET_MAX_OPENS_PER_TICK", 5))
 
@@ -197,35 +210,99 @@ class PolymarketBot:
                             raw_tokens = json.loads(raw_tokens)
                         except Exception:
                             raw_tokens = []
-                    
+
                     if not raw_tokens or len(raw_tokens) < 2:
                         await self._log("ERROR", f"polymarket live order blocked: missing clobTokenIds for {m.id}")
                         continue
-                        
-                    token_id = raw_tokens[0] if side == "YES" else raw_tokens[1]
-                    # Polymarket CLOB enforces a minimum of 5 contracts per order.
-                    # Ensure size >= 5; scale amount up if needed.
-                    CLOB_MIN_SIZE = 5.0
-                    raw_size = amount / max(entry, 0.001)
-                    size = max(raw_size, CLOB_MIN_SIZE)
-                    effective_amount = round(size * entry, 4)
-                    size = round(size, 2)
 
-                    if wallet.balance < effective_amount:
+                    CLOB_MIN_SIZE = 5.0
+                    balance_known = _live_clob_balance is not None and _live_clob_balance > 0.10
+
+                    if balance_known and _live_clob_balance >= 5.0:
+                        # ── MODE B: balance ≥ $5 → $5 on AI-recommended favourite ────────
+                        LIVE_AMOUNT = 5.00
+                        live_side = side
+                        live_entry = entry
+                        raw_size = LIVE_AMOUNT / max(live_entry, 0.001)
+                        live_size = max(raw_size, CLOB_MIN_SIZE)
+                        effective_amount = round(live_size * live_entry, 4)
                         await self._log(
                             "INFO",
-                            f"polymarket live skip {m.id}: wallet ${wallet.balance:.2f} < "
-                            f"min order ${effective_amount:.2f} (size={size}@{entry})",
+                            f"polymarket MODE-B (≥$5): ${LIVE_AMOUNT:.2f} on "
+                            f"{live_side}@{live_entry:.3f} → {live_size:.2f} contracts",
+                        )
+                    else:
+                        # ── MODE A: balance < $5 → $1 on the cheap (underdog) side ───────
+                        # Pick whichever side is cheaper (lower price = underdog).
+                        yes_p = getattr(m, "yes_price", None) or 0.5
+                        no_p  = getattr(m, "no_price",  None) or 0.5
+                        if yes_p <= no_p:
+                            live_side  = "YES"
+                            live_entry = yes_p
+                        else:
+                            live_side  = "NO"
+                            live_entry = no_p
+
+                        # Only viable if cheap side ≤ $0.20 (gives ≥5 contracts for $1).
+                        if live_entry > 0.20:
+                            await self._log(
+                                "INFO",
+                                f"polymarket MODE-A skip {m.id}: cheap side "
+                                f"{live_side}@{live_entry:.3f} > $0.20 — need underdog ≤ $0.20",
+                            )
+                            continue
+
+                        raw_size = 1.00 / max(live_entry, 0.001)
+                        if raw_size < CLOB_MIN_SIZE:
+                            await self._log(
+                                "INFO",
+                                f"polymarket MODE-A skip {m.id}: $1 → {raw_size:.2f} contracts "
+                                f"< CLOB min 5 at {live_entry:.3f}",
+                            )
+                            continue
+
+                        live_size = round(raw_size, 2)
+                        effective_amount = round(live_size * live_entry, 4)
+                        # Override AI side/entry so PolyTrade records the actual bet.
+                        side  = live_side
+                        entry = live_entry
+                        await self._log(
+                            "INFO",
+                            f"polymarket MODE-A (<$5): $1.00 on "
+                            f"{live_side}@{live_entry:.3f} (underdog, {live_size:.2f} contracts)",
+                        )
+
+                    token_id = raw_tokens[0] if live_side == "YES" else raw_tokens[1]
+
+                    # Guard: CLOB on-chain balance must cover the order.
+                    if balance_known and effective_amount > _live_clob_balance - 0.05:
+                        await self._log(
+                            "INFO",
+                            f"polymarket live skip {m.id}: CLOB balance "
+                            f"${_live_clob_balance:.2f} < ${effective_amount:.2f} needed",
                         )
                         continue
 
-                    live_res = await place_live_order(token_id=str(token_id), price=entry, size=size, side="BUY")
+                    # Guard: paper wallet balance.
+                    if wallet.balance < effective_amount:
+                        await self._log(
+                            "INFO",
+                            f"polymarket live skip {m.id}: wallet "
+                            f"${wallet.balance:.2f} < ${effective_amount:.2f}",
+                        )
+                        continue
+
+                    live_res = await place_live_order(
+                        token_id=str(token_id),
+                        price=live_entry,
+                        size=live_size,
+                        side="BUY",
+                    )
                     if not live_res.get("ok"):
                         await self._log("ERROR", f"polymarket live order failed: {live_res.get('error')}")
                         continue
 
                     await self._log("INFO", f"polymarket live order placed {m.id}: {live_res.get('orderID')}")
-                    # Use the effective amount for wallet accounting.
                     amount = effective_amount
 
                 await poly_wallet.debit(s, amount)
@@ -312,6 +389,49 @@ class PolymarketBot:
                             cur_yes = cur_no = None
                         if cur_yes is not None and t.entry_price and t.entry_price > 0:
                             cur = cur_yes if t.direction == "YES" else cur_no
+
+                            # ── Stop Loss: position value dropped -30% ──────────
+                            if cur <= t.entry_price * 0.70:
+                                contracts = t.amount / max(t.entry_price, 0.01)
+                                payout = contracts * cur
+                                pnl = round(payout - t.amount, 4)
+                                t.status = "CLOSED_STOP_LOSS"
+                                t.exit_price = cur
+                                t.pnl = pnl
+                                t.closed_at = datetime.now(timezone.utc)
+
+                                mode = mode_guard.get("polymarket").mode
+                                if mode == "live_armed":
+                                    raw_tokens = data.get("clobTokenIds")
+                                    if isinstance(raw_tokens, str):
+                                        import json
+                                        try:
+                                            raw_tokens = json.loads(raw_tokens)
+                                        except Exception:
+                                            raw_tokens = []
+                                    if raw_tokens and len(raw_tokens) >= 2:
+                                        token_id = raw_tokens[0] if t.direction == "YES" else raw_tokens[1]
+                                        size = round(t.amount / max(t.entry_price, 0.01), 2)
+                                        live_res = await place_live_order(
+                                            token_id=str(token_id), price=cur, size=size, side="SELL"
+                                        )
+                                        if not live_res.get("ok"):
+                                            await self._log("ERROR", f"polymarket live sl exit failed: {live_res.get('error')}")
+
+                                await poly_wallet.credit(s, payout)
+                                await poly_wallet.record_close(s, pnl, False)
+                                await s.commit()
+                                await self._log(
+                                    "INFO",
+                                    f"polymarket SL-30% closed {t.id} entry={t.entry_price:.3f} "
+                                    f"exit={cur:.3f} pnl={pnl:.3f}",
+                                )
+                                await bus.publish("polymarket:trade:closed", {"id": t.id, "pnl": pnl})
+                                w = await poly_wallet.get_wallet(s)
+                                await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
+                                continue
+
+                            # ── Take Profit: position value gained +15% ─────────
                             if cur >= t.entry_price * 1.15:
                                 contracts = t.amount / max(t.entry_price, 0.01)
                                 payout = contracts * cur
