@@ -176,7 +176,11 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
             logger.error(f"Order failed with sig_type {client.builder.signature_type}: {err_msg}")
             
             # If it failed due to signature or maker issues, try falling back dynamically
-            if "order_version_mismatch" in err_msg or "maker address not allowed" in err_msg:
+            sig_errors = (
+                "order_version_mismatch", "maker address not allowed",
+                "invalid signature", "InvalidSignature",
+            )
+            if any(kw in str(err_msg) for kw in sig_errors):
                 return _fallback_order_placement(client, order_args, neg_risk)
 
             return {"ok": False, "error": err_msg}
@@ -196,8 +200,12 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
                              "Set POLYMARKET_PROXY_URL in Railway env to a proxy in an allowed region.",
                 }
 
-            # Signature or maker mismatch — try sig-type fallbacks.
-            if "order_version_mismatch" in err_msg or "maker address not allowed" in err_msg:
+            # Signature / maker mismatch — try sig-type fallbacks.
+            sig_errors = (
+                "order_version_mismatch", "maker address not allowed",
+                "invalid signature", "InvalidSignature",
+            )
+            if any(kw in str(err_msg) for kw in sig_errors):
                 return _fallback_order_placement(client, order_args, neg_risk)
 
         return {"ok": False, "error": err_msg}
@@ -209,14 +217,15 @@ def _fallback_order_placement(original_client, order_args, neg_risk):
         from py_clob_client_v2.clob_types import PartialCreateOrderOptions
         import copy
         
-        # We try these configurations (funder, signature_type)
+        # Try every (funder, sig_type) combination in order of likelihood.
+        # EOA (0) is most common for MetaMask/browser-wallet accounts.
         original_funder = original_client.builder.funder
         configs_to_try = [
-            (original_funder, 2),  # Try Gnosis Safe
-            (original_funder, 1),  # Try Magic Proxy
-            (None, 0),             # Try raw EOA
-            (None, 2),             # Try EOA with Gnosis Safe
-            (None, 1),             # Try EOA with Magic Proxy
+            (None, 0),             # Raw EOA — most common for MetaMask accounts
+            (original_funder, 1),  # Magic Proxy with configured funder
+            (None, 1),             # Magic Proxy, no funder
+            (original_funder, 2),  # Gnosis Safe with configured funder (current default)
+            (None, 2),             # Gnosis Safe, no explicit funder
         ]
         
         for funder, sig_type in configs_to_try:
@@ -232,8 +241,14 @@ def _fallback_order_placement(original_client, order_args, neg_risk):
                     funder=funder,
                     signature_type=sig_type,
                 )
-                fallback_client.set_api_creds(original_client.creds)
-                
+                # Re-derive API creds for this sig_type/funder combo —
+                # creds are account-scoped so reusing originals would mismatch.
+                try:
+                    fb_creds = fallback_client.create_api_key()
+                except Exception:
+                    fb_creds = fallback_client.derive_api_key()
+                fallback_client.set_api_creds(fb_creds)
+
                 signed_order = fallback_client.create_order(
                     order_args,
                     options=PartialCreateOrderOptions(neg_risk=neg_risk),
@@ -241,10 +256,13 @@ def _fallback_order_placement(original_client, order_args, neg_risk):
                 resp = fallback_client.post_order(signed_order)
                 if resp.get("success"):
                     logger.info(f"Fallback SUCCESS! funder={funder}, sig_type={sig_type}")
+                    # Update module-level client so future orders use the working config.
+                    global _client
+                    _client = fallback_client
                     return {"ok": True, "orderID": resp.get("orderID")}
             except Exception as fe:
-                err_str = str(getattr(fe, 'error_msg', getattr(fe, 'error_message', str(fe))))
-                logger.debug(f"Fallback failed for {funder}/{sig_type}: {err_str}")
+                err_str = str(getattr(fe, "error_msg", getattr(fe, "error_message", str(fe))))
+                logger.info(f"Fallback ({funder}/{sig_type}) → {err_str[:80]}")
                 continue
                 
         return {"ok": False, "error": "All signature fallbacks failed."}
