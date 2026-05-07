@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -23,6 +24,11 @@ State = Literal["IDLE", "SCANNING", "ANALYZING", "EXECUTING", "STOPPED"]
 
 
 class PolymarketBot:
+    # Cooldown: market_id → unix timestamp of last live order placed.
+    # Prevents double-ordering the same market across ticks (e.g. if DB trade
+    # is transiently closed by _manage_positions before the next scan).
+    _LIVE_ORDER_COOLDOWN_SECS = 1200  # 20 minutes
+
     def __init__(self) -> None:
         self.state: State = "STOPPED"
         self.started_at: datetime | None = None
@@ -32,6 +38,8 @@ class PolymarketBot:
         self.last_candidate_count = 0
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
+        # Per-session live-order cooldown (market_id → epoch seconds).
+        self._recently_ordered: dict[str, float] = {}
 
     @property
     def running(self) -> bool:
@@ -156,10 +164,25 @@ class PolymarketBot:
                     )
 
             opened_this_tick = 0
-            max_per_tick = max(1, getattr(settings, "POLYMARKET_MAX_OPENS_PER_TICK", 5))
+            # In live mode cap new opens to 4 per tick to avoid flooding.
+            _is_live_tick = _current_mode == "live_armed"
+            max_per_tick = 4 if _is_live_tick else max(1, getattr(settings, "POLYMARKET_MAX_OPENS_PER_TICK", 5))
+
+            # Sync paper wallet balance to real CLOB balance so AMTA shows
+            # the correct figure instead of a stale paper-simulation number.
+            if _is_live_tick and _live_clob_balance is not None and _live_clob_balance > 0:
+                wallet.balance = round(_live_clob_balance, 4)
 
             for m in candidates[:25]:
                 if m.id in open_market_ids:
+                    continue
+                # Per-session cooldown: skip market ordered within last 20 min.
+                _last_ordered = self._recently_ordered.get(m.id)
+                if _last_ordered is not None and (time.time() - _last_ordered) < self._LIVE_ORDER_COOLDOWN_SECS:
+                    await self._log(
+                        "INFO",
+                        f"polymarket cooldown skip {m.id}: ordered {int(time.time()-_last_ordered)}s ago",
+                    )
                     continue
                 if len(open_rows) + opened_this_tick >= settings.POLYMARKET_MAX_OPEN_POSITIONS:
                     break
@@ -321,6 +344,8 @@ class PolymarketBot:
                         continue
 
                     await self._log("INFO", f"polymarket live order placed {m.id}: {live_res.get('orderID')}")
+                    # Record cooldown so we never re-order this market this session.
+                    self._recently_ordered[m.id] = time.time()
                     amount = effective_amount
 
                 await poly_wallet.debit(s, amount)
@@ -342,6 +367,8 @@ class PolymarketBot:
                 )
                 s.add(t)
                 await s.commit()
+                # Prevent re-processing the same market later in this tick.
+                open_market_ids.add(m.id)
                 opened_this_tick += 1
                 self.trades_today += 1
                 await bus.publish(
