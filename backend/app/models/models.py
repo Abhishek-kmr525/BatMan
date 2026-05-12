@@ -95,8 +95,46 @@ class PolyWallet(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     balance: Mapped[float] = mapped_column(Float, default=20.00)
+    trade_balance: Mapped[float] = mapped_column(Float, default=20.00)
+    vault_balance: Mapped[float] = mapped_column(Float, default=0.00)
+    trade_cap_usd: Mapped[float] = mapped_column(Float, default=30.00)
+    vault_sweeps_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_sweep_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     total_pnl: Mapped[float] = mapped_column(Float, default=0.00)
     total_trades: Mapped[int] = mapped_column(Integer, default=0)
     wins: Mapped[int] = mapped_column(Integer, default=0)
     losses: Mapped[int] = mapped_column(Integer, default=0)
+    live_trade_balance: Mapped[float] = mapped_column(Float, default=0.00)
+    live_vault_balance: Mapped[float] = mapped_column(Float, default=0.00)
+    live_trade_cap_usd: Mapped[float] = mapped_column(Float, default=30.00)
+    live_vault_sweeps_count: Mapped[int] = mapped_column(Integer, default=0)
+    live_last_sweep_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    live_last_withdraw_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    live_withdrawn_total: Mapped[float] = mapped_column(Float, default=0.00)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class PolyWithdrawJob(Base):
+    __tablename__ = "poly_withdraw_jobs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    amount_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    tx_hash: Mapped[str | None] = mapped_column(String(140), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    requested_by: Mapped[str] = mapped_column(String(16), default="manual")  # auto|manual
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PolyVaultEvent(Base):
+    __tablename__ = "poly_vault_events"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    event_type: Mapped[str] = mapped_column(String(40), index=True)  # SWEEP|WITHDRAW_*|UNLOCK
+    amount_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    meta_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)

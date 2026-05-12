@@ -1,0 +1,18 @@
+[
+  {
+    "id": "95329847-8683-482c-b09d-b8776eb18bf6",
+    "status": "OPEN",
+    "pnl": 0.0,
+    "entry_price": 0.3,
+    "agent_score": 95,
+    "market_title": "Bitcoin price  on May 3, 2026?"
+  },
+  {
+    "id": "70df7135-1806-40a3-8063-7ccbbb41e8ac",
+    "status": "OPEN",
+    "pnl": 0.0,
+    "entry_price": 0.46,
+    "agent_score": 99,
+    "market_title": "Will the WTI front-month settle oil price  be >101.99 on May 4, 2026?"
+  }
+]

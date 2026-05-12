@@ -4,30 +4,39 @@ import asyncio
 import time
 import csv
 import io
+import os
+import shutil
 from datetime import datetime, timedelta, timezone
 import httpx
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from pydantic import BaseModel
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import delete, desc, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent import knowledge
 from app.agent.analyzer import analyze_market, check_claude_health, check_gemini_health
 from app.core.config import settings
 from app.core.db import get_session
-from app.models.models import BotLog, PolyTrade, Trade
+from app.models.models import BotLog, PolyTrade, PolyVaultEvent, PolyWithdrawJob, Trade
 from app.services import executor as exec_svc
 from app.services import poly_wallet, strategies, wallet
 from app.services.bot import bot
-from app.services.bot_polymarket import poly_bot
+from app.services.bot_polymarket import poly_bot, poly_live_bot, poly_paper_bot
 from app.services.events import bus
 from app.services.intel import gather_market_intel
 from app.services.kalshi import get_kalshi
 from app.services.kalshi import Market
 from app.services.mode_guard import mode_guard
 from app.services.poly_live import get_live_balance, get_live_balance_error
+from app.services.poly_live_vault import (
+    compute_auto_withdraw_eligibility,
+    execute_withdraw_job,
+    has_active_withdraw_job,
+    request_withdraw_job,
+    sweep_live_excess_if_needed,
+)
 from app.services.polymarket import get_polymarket
 from app.services.wallet_reconcile import reconcile_kalshi_paper, reconcile_polymarket_paper
 from app.services.canary_guard import check_kalshi_canary, check_polymarket_canary
@@ -35,6 +44,13 @@ from app.services.canary_guard import check_kalshi_canary, check_polymarket_cana
 router = APIRouter()
 _MARKET_CLOSE_CACHE: dict[str, tuple[float, int | None]] = {}
 _MARKET_CLOSE_CACHE_TTL_SECONDS = 30.0
+_POLY_LIVE_AUTO_WITHDRAW_OVERRIDE: bool | None = None
+
+
+def _poly_live_auto_withdraw_enabled() -> bool:
+    if _POLY_LIVE_AUTO_WITHDRAW_OVERRIDE is None:
+        return bool(settings.POLY_LIVE_AUTO_WITHDRAW_ENABLED)
+    return bool(_POLY_LIVE_AUTO_WITHDRAW_OVERRIDE)
 
 
 # ---------- Bot ----------
@@ -127,6 +143,20 @@ class PolyResetBody(BaseModel):
     balance: float = 20.0
 
 
+class MaintenanceCleanupBody(BaseModel):
+    passcode: str
+    keep_recent_logs: int = 1000
+
+
+class MaintenanceReclaimBody(BaseModel):
+    passcode: str
+
+
+class MaintenanceInspectBody(BaseModel):
+    passcode: str
+    top_n: int = 30
+
+
 @router.post("/maintenance/poly/reset")
 async def maintenance_poly_reset(body: PolyResetBody, session: AsyncSession = Depends(get_session)):
     if body.passcode != settings.MAINTENANCE_PASSCODE:
@@ -135,6 +165,11 @@ async def maintenance_poly_reset(body: PolyResetBody, session: AsyncSession = De
     await session.execute(delete(PolyTrade))
     w = await poly_wallet.get_wallet(session)
     w.balance = round(max(body.balance, 0.0), 4)
+    w.trade_balance = w.balance
+    w.vault_balance = 0.0
+    w.trade_cap_usd = float(settings.POLYMARKET_VAULT_TRADE_CAP_USD)
+    w.vault_sweeps_count = 0
+    w.last_sweep_at = None
     w.total_pnl = 0.0
     w.total_trades = 0
     w.wins = 0
@@ -143,6 +178,86 @@ async def maintenance_poly_reset(body: PolyResetBody, session: AsyncSession = De
     await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
     await bus.publish("polymarket:trades:cleared", {"ok": True})
     return {"ok": True, "balance": w.balance, "trades_deleted": "all"}
+
+
+@router.post("/maintenance/storage/cleanup")
+async def maintenance_storage_cleanup(
+    body: MaintenanceCleanupBody,
+    session: AsyncSession = Depends(get_session),
+):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+
+    # SQLite in production can hit "too many SQL variables" with large IN lists.
+    # For emergency storage recovery, purge log table in one statement.
+    total_before = int((await session.execute(select(func.count(BotLog.id)))).scalar_one() or 0)
+    await session.execute(delete(BotLog))
+    deleted_logs = total_before
+
+    await session.commit()
+    # Best-effort SQLite reclaim for /data disk pressure.
+    try:
+        await session.execute(text("VACUUM"))
+        await session.commit()
+    except Exception:
+        await session.rollback()
+
+    await bus.publish("maintenance:storage:cleanup", {"deleted_logs": deleted_logs, "keep_recent_logs": keep_recent})
+    return {"ok": True, "deleted_logs": deleted_logs, "keep_recent_logs": keep_recent}
+
+
+@router.post("/maintenance/storage/reclaim")
+async def maintenance_storage_reclaim(body: MaintenanceReclaimBody):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+
+    targets = [
+        "/data/chroma",
+        "/data/chroma_live",
+        "/data/knowledge_index",
+        "./data/chroma",
+        "./knowledge/chroma",
+    ]
+    removed: list[str] = []
+    missing: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    for p in targets:
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=False)
+                removed.append(p)
+            else:
+                missing.append(p)
+        except Exception as e:
+            failed.append({"path": p, "error": str(e)})
+
+    await bus.publish("maintenance:storage:reclaim", {"removed": removed, "failed": failed})
+    return {"ok": len(failed) == 0, "removed": removed, "missing": missing, "failed": failed}
+
+
+@router.post("/maintenance/storage/inspect")
+async def maintenance_storage_inspect(body: MaintenanceInspectBody):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+
+    roots = ["/data", "./data", "./knowledge"]
+    top_n = max(1, min(int(body.top_n), 200))
+    files: list[dict[str, float | str]] = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for base, _dirs, names in os.walk(root):
+            for nm in names:
+                p = os.path.join(base, nm)
+                try:
+                    sz = float(os.path.getsize(p))
+                except Exception:
+                    continue
+                files.append({"path": p, "size_mb": round(sz / (1024 * 1024), 4)})
+
+    files.sort(key=lambda x: float(x.get("size_mb", 0.0)), reverse=True)
+    return {"ok": True, "roots": roots, "files": files[:top_n]}
 
 
 # ---------- Trades ----------
@@ -226,27 +341,73 @@ async def trade_get(trade_id: str, session: AsyncSession = Depends(get_session))
 # ---------- Polymarket ----------
 @router.post("/polymarket/bot/start")
 async def polymarket_bot_start():
-    await poly_bot.start()
-    return poly_bot.status()
+    await poly_paper_bot.start()
+    return poly_paper_bot.status()
 
 
 @router.post("/polymarket/bot/stop")
 async def polymarket_bot_stop():
-    await poly_bot.stop()
-    return poly_bot.status()
+    await poly_paper_bot.stop()
+    return poly_paper_bot.status()
 
 
 @router.get("/polymarket/bot/status")
 async def polymarket_bot_status(session: AsyncSession = Depends(get_session)):
-    current_mode = "live" if mode_guard.get("polymarket").mode == "live_armed" else "paper"
+    current_mode = "paper"
     res = await session.execute(
         select(PolyTrade).where(PolyTrade.status == "OPEN", PolyTrade.mode == current_mode)
     )
     active = len(list(res.scalars().all()))
-    s = poly_bot.status()
+    s = poly_paper_bot.status()
     s["active_positions"] = active
     s["max_concurrent_positions"] = settings.POLYMARKET_MAX_OPEN_POSITIONS
     s["mode_guard"] = mode_guard.get("polymarket").to_dict()
+    return s
+
+
+@router.post("/polymarket/paper/bot/start")
+async def polymarket_paper_bot_start():
+    await poly_paper_bot.start()
+    return poly_paper_bot.status()
+
+
+@router.post("/polymarket/paper/bot/stop")
+async def polymarket_paper_bot_stop():
+    await poly_paper_bot.stop()
+    return poly_paper_bot.status()
+
+
+@router.get("/polymarket/paper/bot/status")
+async def polymarket_paper_bot_status(session: AsyncSession = Depends(get_session)):
+    res = await session.execute(
+        select(PolyTrade).where(PolyTrade.status == "OPEN", PolyTrade.mode == "paper")
+    )
+    active = len(list(res.scalars().all()))
+    s = poly_paper_bot.status()
+    s["active_positions"] = active
+    return s
+
+
+@router.post("/polymarket/live/bot/start")
+async def polymarket_live_bot_start():
+    await poly_live_bot.start()
+    return poly_live_bot.status()
+
+
+@router.post("/polymarket/live/bot/stop")
+async def polymarket_live_bot_stop():
+    await poly_live_bot.stop()
+    return poly_live_bot.status()
+
+
+@router.get("/polymarket/live/bot/status")
+async def polymarket_live_bot_status(session: AsyncSession = Depends(get_session)):
+    res = await session.execute(
+        select(PolyTrade).where(PolyTrade.status == "OPEN", PolyTrade.mode == "live")
+    )
+    active = len(list(res.scalars().all()))
+    s = poly_live_bot.status()
+    s["active_positions"] = active
     return s
 
 
@@ -267,6 +428,50 @@ class KillSwitchBody(BaseModel):
 
 class ModeSetPaperBody(BaseModel):
     platform: str
+
+
+class PolyVaultResetBody(BaseModel):
+    passcode: str
+
+
+class PolyVaultSetCapBody(BaseModel):
+    passcode: str
+    cap_usd: float
+
+
+class PolyVaultUnlockBody(BaseModel):
+    passcode: str
+    amount: float
+
+
+class PolyLiveVaultSetCapBody(BaseModel):
+    passcode: str
+    cap_usd: float
+
+
+class PolyLiveVaultUnlockBody(BaseModel):
+    passcode: str
+    amount: float
+
+
+class PolyLiveWithdrawBody(BaseModel):
+    passcode: str
+    amount_usd: float | None = None
+    requested_by: str = "manual"
+
+
+class PolyLiveRetryWithdrawBody(BaseModel):
+    passcode: str
+
+
+class PolyLiveAutoWithdrawToggleBody(BaseModel):
+    passcode: str
+    enabled: bool
+
+
+class PolyLiveTradeDeleteBody(BaseModel):
+    passcode: str
+    trade_id: str
 
 
 @router.get("/mode/status")
@@ -312,11 +517,13 @@ async def mode_kill_switch(body: KillSwitchBody):
     return mode_guard.set_kill_switch(platform, body.enabled)  # type: ignore[arg-type]
 
 
-@router.get("/polymarket/wallet")
-async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
-    is_live = mode_guard.get("polymarket").mode == "live_armed"
-    current_mode = "live" if is_live else "paper"
+async def _polymarket_wallet_by_mode(current_mode: str, session: AsyncSession) -> dict:
+    is_live = current_mode == "live"
     live_error = None
+    w = await poly_wallet.get_wallet(session)
+    live_trade_balance = float(w.live_trade_balance or 0.0)
+    live_vault_balance = float(w.live_vault_balance or 0.0)
+    live_actual_balance = live_trade_balance + live_vault_balance
 
     # Stats are always scoped to the current mode so live and paper don't bleed
     # into each other. Paper balance still comes from the simulated wallet
@@ -331,15 +538,34 @@ async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
             bal_err = get_live_balance_error()
             if bal_err:
                 live_error = bal_err
+            if settings.POLY_LIVE_VAULT_ENABLED:
+                w, _ = await sweep_live_excess_if_needed(session, w, balance)
+                await session.commit()
+                live_trade_balance = float(w.live_trade_balance or 0.0)
+                live_vault_balance = float(w.live_vault_balance or 0.0)
+                live_actual_balance = live_trade_balance + live_vault_balance
+            else:
+                # Keep live wallet fields aligned with real CLOB balance even when
+                # vaulting is disabled so the live UI never shows stale zeroes.
+                live_trade_balance = float(balance)
+                live_vault_balance = 0.0
+                live_actual_balance = float(balance)
     else:
-        w = await poly_wallet.get_wallet(session)
         balance = w.balance
+
+    exclude_ids = {
+        x.strip()
+        for x in str(getattr(settings, "POLYMARKET_LIVE_EXCLUDE_TRADE_IDS", "") or "").split(",")
+        if x.strip()
+    }
 
     closed_q = select(PolyTrade).where(
         PolyTrade.mode == current_mode,
         PolyTrade.status.like("CLOSED%"),
     )
     closed = (await session.execute(closed_q)).scalars().all()
+    if is_live and exclude_ids:
+        closed = [t for t in closed if t.id not in exclude_ids]
     total_pnl = float(sum((t.pnl or 0.0) for t in closed))
     wins = sum(1 for t in closed if (t.pnl or 0.0) > 0)
     losses = sum(1 for t in closed if (t.pnl or 0.0) < 0)
@@ -348,13 +574,216 @@ async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
 
     return {
         "balance": round(balance, 4),
+        "trade_balance": round((w.trade_balance if not is_live else balance), 4),
+        "vault_balance": round((w.vault_balance if not is_live else 0.0), 4),
+        "actual_balance": round((w.trade_balance + w.vault_balance) if not is_live else balance, 4),
+        "trade_cap_usd": round((w.trade_cap_usd if not is_live else float(settings.POLYMARKET_VAULT_TRADE_CAP_USD)), 4),
+        "force_mode_a": bool(settings.POLYMARKET_FORCE_MODE_A),
+        "vault_locked": True,
+        "vault_sweeps_count": int(w.vault_sweeps_count if not is_live else 0),
+        "last_sweep_at": (w.last_sweep_at.isoformat() if (not is_live and w.last_sweep_at) else None),
         "total_pnl": round(total_pnl, 4),
         "total_trades": total_trades,
         "wins": wins,
         "losses": losses,
         "win_rate": round(win_rate, 2),
         "live_error": live_error,
+        "live_trade_balance": round(live_trade_balance, 4),
+        "live_vault_balance": round(live_vault_balance, 4),
+        "live_actual_balance": round(live_actual_balance, 4),
+        "live_trade_cap_usd": round(float(w.live_trade_cap_usd or settings.POLY_LIVE_TRADE_CAP_USD), 4),
+        "live_vault_locked": True,
+        "live_vault_sweeps_count": int(w.live_vault_sweeps_count or 0),
+        "live_last_sweep_at": (w.live_last_sweep_at.isoformat() if w.live_last_sweep_at else None),
+        "live_last_withdraw_at": (w.live_last_withdraw_at.isoformat() if w.live_last_withdraw_at else None),
+        "live_withdrawn_total": round(float(w.live_withdrawn_total or 0.0), 4),
+        "live_vault_enabled": bool(settings.POLY_LIVE_VAULT_ENABLED),
+        "live_auto_withdraw_enabled": bool(_poly_live_auto_withdraw_enabled()),
     }
+
+
+@router.get("/polymarket/wallet")
+async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
+    # Backward-compatible legacy endpoint: paper-only.
+    return await _polymarket_wallet_by_mode("paper", session)
+
+
+@router.get("/polymarket/paper/wallet")
+async def polymarket_paper_wallet_get(session: AsyncSession = Depends(get_session)):
+    return await _polymarket_wallet_by_mode("paper", session)
+
+
+@router.get("/polymarket/live/wallet")
+async def polymarket_live_wallet_get(session: AsyncSession = Depends(get_session)):
+    return await _polymarket_wallet_by_mode("live", session)
+
+
+@router.post("/polymarket/vault/reset")
+async def polymarket_vault_reset(body: PolyVaultResetBody, session: AsyncSession = Depends(get_session)):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    w = await poly_wallet.reset_vault(session)
+    await session.commit()
+    await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
+    return {
+        "ok": True,
+        "trade_balance": round(w.trade_balance, 4),
+        "vault_balance": round(w.vault_balance, 4),
+        "actual_balance": round(w.trade_balance + w.vault_balance, 4),
+    }
+
+
+@router.post("/polymarket/vault/set-cap")
+async def polymarket_vault_set_cap(body: PolyVaultSetCapBody, session: AsyncSession = Depends(get_session)):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    w, swept = await poly_wallet.set_trade_cap(session, body.cap_usd)
+    await session.commit()
+    await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
+    return {
+        "ok": True,
+        "trade_cap_usd": round(w.trade_cap_usd, 4),
+        "swept": round(swept, 4),
+        "trade_balance": round(w.trade_balance, 4),
+        "vault_balance": round(w.vault_balance, 4),
+    }
+
+
+@router.post("/polymarket/vault/unlock-to-trade")
+async def polymarket_vault_unlock_to_trade(body: PolyVaultUnlockBody, session: AsyncSession = Depends(get_session)):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    w = await poly_wallet.unlock_to_trade(session, body.amount)
+    await session.commit()
+    await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
+    return {
+        "ok": True,
+        "trade_balance": round(w.trade_balance, 4),
+        "vault_balance": round(w.vault_balance, 4),
+        "actual_balance": round(w.trade_balance + w.vault_balance, 4),
+    }
+
+
+@router.post("/polymarket/live/vault/set-cap")
+async def polymarket_live_vault_set_cap(body: PolyLiveVaultSetCapBody, session: AsyncSession = Depends(get_session)):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    w = await poly_wallet.get_wallet(session)
+    w.live_trade_cap_usd = round(max(0.01, float(body.cap_usd)), 4)
+    if settings.POLY_LIVE_VAULT_ENABLED:
+        balance = await get_live_balance()
+        w, swept = await sweep_live_excess_if_needed(session, w, balance)
+        if swept > 0:
+            await bus.publish("agent:log", {"level": "INFO", "message": f"LIVE_VAULT_SWEEP +${swept:.2f}", "metadata": {"platform": "polymarket"}, "ts": datetime.now(timezone.utc).isoformat()})
+    await session.commit()
+    return {"ok": True, "live_trade_cap_usd": w.live_trade_cap_usd, "live_trade_balance": w.live_trade_balance, "live_vault_balance": w.live_vault_balance}
+
+
+@router.post("/polymarket/live/vault/unlock-to-trade")
+async def polymarket_live_vault_unlock_to_trade(body: PolyLiveVaultUnlockBody, session: AsyncSession = Depends(get_session)):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    w = await poly_wallet.get_wallet(session)
+    move = round(max(0.0, min(float(body.amount), float(w.live_vault_balance or 0.0))), 4)
+    w.live_vault_balance = round(float(w.live_vault_balance or 0.0) - move, 4)
+    w.live_trade_balance = round(float(w.live_trade_balance or 0.0) + move, 4)
+    session.add(PolyVaultEvent(event_type="UNLOCK", amount_usd=move, meta_json={"scope": "live_manual_unlock"}))
+    await session.commit()
+    return {
+        "ok": True,
+        "moved": move,
+        "live_trade_balance": round(w.live_trade_balance, 4),
+        "live_vault_balance": round(w.live_vault_balance, 4),
+    }
+
+
+@router.post("/polymarket/live/vault/withdraw")
+async def polymarket_live_vault_withdraw(body: PolyLiveWithdrawBody, session: AsyncSession = Depends(get_session)):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    state = mode_guard.get("polymarket")
+    if state.kill_switch:
+        raise HTTPException(status_code=409, detail="kill switch is ON")
+    w = await poly_wallet.get_wallet(session)
+    amount = float(body.amount_usd or 0.0)
+    if amount <= 0:
+        candidate = round(float(w.live_vault_balance or 0.0) - float(settings.POLY_LIVE_VAULT_KEEP_BUFFER_USD), 4)
+        amount = candidate
+    amount = round(max(amount, 0.0), 4)
+    if amount < float(settings.POLY_LIVE_MIN_WITHDRAW_USD):
+        raise HTTPException(status_code=400, detail="amount below min withdraw")
+    if amount > float(w.live_vault_balance or 0.0):
+        raise HTTPException(status_code=400, detail="insufficient live vault balance")
+    if await has_active_withdraw_job(session):
+        raise HTTPException(status_code=409, detail="active withdraw job exists")
+    job = await request_withdraw_job(session, amount_usd=amount, requested_by=body.requested_by or "manual")
+    await session.flush()
+    await execute_withdraw_job(session, job, w)
+    await session.commit()
+    return {"ok": True, "job_id": job.id, "status": job.status, "tx_hash": job.tx_hash, "error_message": job.error_message}
+
+
+@router.get("/polymarket/live/vault/withdraw-jobs")
+async def polymarket_live_vault_withdraw_jobs(limit: int = 50, session: AsyncSession = Depends(get_session)):
+    q = select(PolyWithdrawJob).order_by(desc(PolyWithdrawJob.created_at)).limit(max(1, min(limit, 200)))
+    rows = (await session.execute(q)).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "amount_usd": r.amount_usd,
+            "status": r.status,
+            "idempotency_key": r.idempotency_key,
+            "tx_hash": r.tx_hash,
+            "error_message": r.error_message,
+            "attempts": r.attempts,
+            "requested_by": r.requested_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/polymarket/live/vault/withdraw-jobs/{job_id}/retry")
+async def polymarket_live_vault_withdraw_retry(job_id: str, body: PolyLiveRetryWithdrawBody, session: AsyncSession = Depends(get_session)):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    state = mode_guard.get("polymarket")
+    if state.kill_switch:
+        raise HTTPException(status_code=409, detail="kill switch is ON")
+    res = await session.execute(select(PolyWithdrawJob).where(PolyWithdrawJob.id == job_id))
+    job = res.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="withdraw job not found")
+    w = await poly_wallet.get_wallet(session)
+    await execute_withdraw_job(session, job, w)
+    await session.commit()
+    return {"ok": True, "job_id": job.id, "status": job.status, "attempts": job.attempts, "tx_hash": job.tx_hash, "error_message": job.error_message}
+
+
+@router.post("/polymarket/live/vault/auto-withdraw/toggle")
+async def polymarket_live_auto_withdraw_toggle(body: PolyLiveAutoWithdrawToggleBody):
+    global _POLY_LIVE_AUTO_WITHDRAW_OVERRIDE
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    _POLY_LIVE_AUTO_WITHDRAW_OVERRIDE = bool(body.enabled)
+    return {"ok": True, "enabled": bool(_POLY_LIVE_AUTO_WITHDRAW_OVERRIDE)}
+
+
+@router.post("/polymarket/live/trades/delete")
+async def polymarket_live_trade_delete(body: PolyLiveTradeDeleteBody, session: AsyncSession = Depends(get_session)):
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    res = await session.execute(
+        select(PolyTrade).where(PolyTrade.id == body.trade_id, PolyTrade.mode == "live")
+    )
+    t = res.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="live trade not found")
+    await session.delete(t)
+    await session.commit()
+    return {"ok": True, "deleted_id": body.trade_id}
 
 
 @router.get("/polymarket/live/health")
@@ -378,11 +807,14 @@ async def polymarket_live_health():
 @router.get("/polymarket/trades")
 async def polymarket_trades(
     status: str = "open",
+    mode: str | None = None,
     limit: int = 50,
     page: int = 1,
     session: AsyncSession = Depends(get_session),
 ):
-    current_mode = "live" if mode_guard.get("polymarket").mode == "live_armed" else "paper"
+    current_mode = (mode or "").strip().lower()
+    if current_mode not in {"paper", "live"}:
+        current_mode = "paper"
     q = select(PolyTrade).where(PolyTrade.mode == current_mode)
     if status == "open":
         q = q.where(PolyTrade.status == "OPEN")
@@ -390,19 +822,44 @@ async def polymarket_trades(
         q = q.where(PolyTrade.status.like("CLOSED%"))
     q = q.order_by(desc(PolyTrade.opened_at)).offset(max(page - 1, 0) * limit).limit(limit)
     rows = (await session.execute(q)).scalars().all()
+    if current_mode == "live":
+        exclude_ids = {
+            x.strip()
+            for x in str(getattr(settings, "POLYMARKET_LIVE_EXCLUDE_TRADE_IDS", "") or "").split(",")
+            if x.strip()
+        }
+        if exclude_ids:
+            rows = [t for t in rows if t.id not in exclude_ids]
     return [_poly_trade_dict(t) for t in rows]
 
 
 @router.get("/polymarket/trades/summary")
-async def polymarket_trades_summary(session: AsyncSession = Depends(get_session)):
+async def polymarket_trades_summary(mode: str | None = None, session: AsyncSession = Depends(get_session)):
     now = datetime.now(timezone.utc)
     start_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    current_mode = "live" if mode_guard.get("polymarket").mode == "live_armed" else "paper"
-    total = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode))).scalar_one() or 0)
-    open_count = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.status == "OPEN"))).scalar_one() or 0)
-    closed_count = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.status.like("CLOSED%")))).scalar_one() or 0)
-    today_opened = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.opened_at >= start_utc))).scalar_one() or 0)
-    today_closed = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.closed_at.is_not(None), PolyTrade.closed_at >= start_utc))).scalar_one() or 0)
+    current_mode = (mode or "").strip().lower()
+    if current_mode not in {"paper", "live"}:
+        current_mode = "paper"
+    if current_mode == "live":
+        exclude_ids = {
+            x.strip()
+            for x in str(getattr(settings, "POLYMARKET_LIVE_EXCLUDE_TRADE_IDS", "") or "").split(",")
+            if x.strip()
+        }
+        rows = (await session.execute(select(PolyTrade).where(PolyTrade.mode == current_mode))).scalars().all()
+        if exclude_ids:
+            rows = [t for t in rows if t.id not in exclude_ids]
+        total = len(rows)
+        open_count = sum(1 for t in rows if t.status == "OPEN")
+        closed_count = sum(1 for t in rows if (t.status or "").startswith("CLOSED"))
+        today_opened = sum(1 for t in rows if t.opened_at and t.opened_at >= start_utc)
+        today_closed = sum(1 for t in rows if t.closed_at and t.closed_at >= start_utc)
+    else:
+        total = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode))).scalar_one() or 0)
+        open_count = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.status == "OPEN"))).scalar_one() or 0)
+        closed_count = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.status.like("CLOSED%")))).scalar_one() or 0)
+        today_opened = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.opened_at >= start_utc))).scalar_one() or 0)
+        today_closed = int((await session.execute(select(func.count(PolyTrade.id)).where(PolyTrade.mode == current_mode, PolyTrade.closed_at.is_not(None), PolyTrade.closed_at >= start_utc))).scalar_one() or 0)
     return {
         "total_count": total,
         "open_count": open_count,
@@ -428,6 +885,32 @@ async def polymarket_markets(limit: int = 30):
             "event_slug": str((((m.raw or {}).get("events") or [{}])[0].get("slug") or "")),
         }
         for m in markets
+    ]
+
+
+@router.get("/polymarket/logs")
+async def polymarket_logs(limit: int = 100, mode: str | None = None, session: AsyncSession = Depends(get_session)):
+    res = await session.execute(
+        select(BotLog).order_by(desc(BotLog.created_at)).limit(500)
+    )
+    rows = res.scalars().all()
+    wanted_kind = None
+    m = (mode or "").strip().lower()
+    if m in {"paper", "live"}:
+        wanted_kind = m
+    poly_rows = [
+        r for r in rows
+        if (r.metadata_json or {}).get("platform") == "polymarket"
+        and (wanted_kind is None or (r.metadata_json or {}).get("bot_kind") == wanted_kind)
+    ][:limit]
+    return [
+        {
+            "id": r.id,
+            "level": r.level,
+            "message": r.message,
+            "ts": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in reversed(poly_rows)
     ]
 
 
@@ -564,6 +1047,8 @@ async def risk_limits():
             "max_daily_loss_usd": settings.POLYMARKET_MAX_DAILY_LOSS_USD,
             "max_open_positions": settings.POLYMARKET_MAX_OPEN_POSITIONS,
             "min_trade_score": settings.POLYMARKET_MIN_SCORE,
+            "mode_a_max_underdog_price": settings.POLYMARKET_MODE_A_MAX_UNDERDOG_PRICE,
+            "force_mode_a": settings.POLYMARKET_FORCE_MODE_A,
             "time_window_seconds": [
                 settings.POLYMARKET_MIN_TIME_TO_CLOSE_SECONDS,
                 settings.POLYMARKET_MAX_TIME_TO_CLOSE_SECONDS,

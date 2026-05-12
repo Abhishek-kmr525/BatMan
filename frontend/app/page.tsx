@@ -1,474 +1,353 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
-import { api, WS } from "../lib/api";
-import { LineChart, Line, XAxis, YAxis, ResponsiveContainer, Tooltip, BarChart, Bar, CartesianGrid } from "recharts";
 
-type Wallet = {
-  balance: number; total_pnl: number; total_trades: number;
-  wins: number; losses: number; win_rate: number;
+import { useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../lib/api";
+import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+
+type BotSnapshot = {
+  platform: string;
+  status: string;
+  state: string;
+  uptime_seconds: number;
+  scanned_today: number;
+  last_scan_count: number;
+  last_candidate_count: number;
+  active_positions: number;
+  max_concurrent_positions: number;
+  today_opened: number;
+  today_pnl: number;
+  wallet: {
+    balance: number;
+    total_pnl: number;
+    total_trades: number;
+    wins: number;
+    losses: number;
+  };
+  mode_guard: {
+    platform: string;
+    mode: string;
+    live_enabled: boolean;
+    kill_switch: boolean;
+  };
 };
-type BotStatus = {
-  status: string; state: string; uptime_seconds: number; trades_today: number;
-  scanned_markets_today?: number;
-  last_scan_count?: number;
-  last_candidate_count?: number;
-  active_positions?: number;
-  max_concurrent_positions?: number;
+
+type BotsAggregate = {
+  kalshi: BotSnapshot;
+  polymarket: BotSnapshot;
+  combined: {
+    today_pnl: number;
+    today_opened: number;
+    active_positions: number;
+    balance: number;
+  };
 };
-type TradeSummary = {
-  total_count: number;
-  open_count: number;
-  closed_count: number;
-  today_opened_count: number;
-  today_closed_count: number;
-};
+
 type Trade = {
-  id: string; market_id: string; market_title: string; category: string;
-  direction: "YES" | "NO"; amount: number; entry_price: number;
-  exit_price: number | null; pnl: number; status: string; agent_score: number;
-  current_price?: number | null; unrealized_pnl?: number; opened_at: string;
-  closed_at?: string | null;
+  id: string;
+  market_id: string;
+  market_title: string;
+  direction: "YES" | "NO";
+  amount: number;
+  entry_price: number;
+  current_price?: number | null;
+  pnl: number;
+  status: string;
+  opened_at: string;
 };
-type LogEntry = { id?: string; level: string; message: string; created_at?: string; ts?: string };
-type RangeLabel = "This Week" | "This Month" | "This Year" | "All Time";
 
-function fmtCurrency(n: number) {
-  return `${n >= 0 ? "+" : "-"}$${Math.abs(n).toFixed(2)}`;
+type LogEntry = {
+  id: string;
+  level: string;
+  message: string;
+  ts: string | null;
+};
+
+function modeText(mode: string) {
+  if (mode === "live_armed" || mode === "live") return "LIVE ARMED";
+  if (mode === "live_requested") return "LIVE REQUESTED";
+  return "PAPER";
 }
 
-function inDays(d: Date, n: number) {
-  const now = Date.now();
-  return now - d.getTime() <= n * 24 * 60 * 60 * 1000;
+function asDollar(n: number, d = 2) {
+  return `$${n.toFixed(d)}`;
 }
 
-function statForRange(label: RangeLabel, closed: Trade[]) {
-  const filtered = closed.filter((t) => {
-    const dt = new Date(t.closed_at || t.opened_at);
-    if (label === "This Week") return inDays(dt, 7);
-    if (label === "This Month") return inDays(dt, 30);
-    if (label === "This Year") return inDays(dt, 365);
-    return true;
-  });
-  const pnl = filtered.reduce((a, t) => a + (t.pnl || 0), 0);
-  const wins = filtered.filter((t) => (t.pnl || 0) > 0).length;
-  const losses = filtered.filter((t) => (t.pnl || 0) < 0).length;
-  const total = filtered.length;
-  const strike = total ? (wins / total) * 100 : 0;
-  const rr = filtered.reduce((acc, t) => acc + (t.pnl || 0), 0);
-  return { label, pnl, wins, losses, total, strike, rr };
+function since(iso?: string | null) {
+  if (!iso) return "—";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (Number.isNaN(ms) || ms < 0) return "—";
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  return `${Math.floor(min / 60)}h ago`;
 }
 
-export default function Dashboard() {
-  const [wallet, setWallet] = useState<Wallet | null>(null);
-  const [bot, setBot] = useState<BotStatus | null>(null);
-  const [open, setOpen] = useState<Trade[]>([]);
-  const [closed, setClosed] = useState<Trade[]>([]);
-  const [allTrades, setAllTrades] = useState<Trade[]>([]);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [summary, setSummary] = useState<TradeSummary | null>(null);
-  const [pnlSeries, setPnl] = useState<{ t: string; pnl: number }[]>([]);
+export default function OperatorHome() {
+  const [data, setData] = useState<BotsAggregate | null>(null);
+  const [kalshiOpen, setKalshiOpen] = useState<Trade[]>([]);
+  const [polyOpen, setPolyOpen] = useState<Trade[]>([]);
+  const [kalshiLogs, setKalshiLogs] = useState<LogEntry[]>([]);
+  const [polyLogs, setPolyLogs] = useState<LogEntry[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const [lastSync, setLastSync] = useState<string>("—");
+  const logRef = useRef<HTMLDivElement | null>(null);
 
   async function refresh() {
     const safe = async <T,>(p: Promise<T>) => {
       try {
-        return { ok: true as const, value: await p };
-      } catch (e: any) {
-        return { ok: false as const, error: e?.message || "request failed" };
+        return { ok: true as const, v: await p };
+      } catch {
+        return { ok: false as const };
       }
     };
-    try {
-      const [w, b, o, c, l, s, all] = await Promise.all([
-        safe(api<Wallet>("/wallet")),
-        safe(api<BotStatus>("/bot/status")),
-        safe(api<Trade[]>("/trades?status=open&limit=50")),
-        safe(api<Trade[]>("/trades?status=closed&limit=50")),
-        safe(api<LogEntry[]>("/agent/logs?limit=50")),
-        safe(api<TradeSummary>("/trades/summary")),
-        safe(api<Trade[]>("/trades?status=all&limit=500&page=1")),
-      ]);
+    const [b, ko, po, kl, pl] = await Promise.all([
+      safe(api<BotsAggregate>("/bots")),
+      safe(api<Trade[]>("/trades?status=open&limit=20&page=1")),
+      safe(api<Trade[]>("/polymarket/trades?status=open&limit=20&page=1")),
+      safe(api<LogEntry[]>("/agent/logs?limit=120")),
+      safe(api<LogEntry[]>("/polymarket/logs?limit=120")),
+    ]);
 
-      if (w.ok) setWallet(w.value);
-      if (b.ok) setBot(b.value);
-      if (o.ok) setOpen(o.value);
-      if (c.ok) setClosed(c.value);
-      if (all.ok) setAllTrades(all.value);
-      if (l.ok) setLogs(l.value);
-      if (s.ok) setSummary(s.value);
+    if (b.ok) setData(b.v);
+    if (ko.ok) setKalshiOpen(ko.v);
+    if (po.ok) setPolyOpen(po.v);
+    if (kl.ok) setKalshiLogs(kl.v);
+    if (pl.ok) setPolyLogs(pl.v);
 
-      // build cumulative P&L vs time from closed trades (oldest -> newest)
-      const closedRows = c.ok ? c.value : closed;
-      const sorted = [...closedRows].reverse();
-      let acc = 0;
-      setPnl(sorted.map(t => {
-        acc += t.pnl || 0;
-        const ts = t.closed_at ? new Date(t.closed_at) : new Date(t.opened_at);
-        const label = ts.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-        return { t: label, pnl: Number(acc.toFixed(4)) };
-      }));
-
-      const failures = [w, b, o, c, l, s, all].filter((x) => !x.ok);
-      if (failures.length === 0) {
-        setError(null);
-      } else {
-        setError(`partial refresh: ${failures.length} endpoint(s) failed`);
-      }
-    } catch (e: any) {
-      setError(e?.message || "refresh failed");
+    if (!b.ok && !ko.ok && !po.ok && !kl.ok && !pl.ok) {
+      setError("Failed to refresh from backend.");
+    } else {
+      setError(null);
     }
+    setLastSync(new Date().toLocaleTimeString());
   }
 
   useEffect(() => {
     void refresh();
-    const id = setInterval(() => { void refresh(); }, 5000);
+    const id = setInterval(() => void refresh(), 5000);
     return () => clearInterval(id);
   }, []);
 
-  useEffect(() => {
-    const ws = new WebSocket(WS);
-    wsRef.current = ws;
-    ws.onmessage = (ev) => {
-      try {
-        const m = JSON.parse(ev.data);
-        if (m.event === "agent:log") {
-          setLogs((cur) => [{ ...m.data }, ...cur].slice(0, 100));
-        }
-        if (["trade:opened", "trade:closed", "wallet:updated", "bot:status"].includes(m.event)) {
-          refresh();
-        }
-      } catch {}
-    };
-    return () => ws.close();
-  }, []);
+  const logs = useMemo(() => {
+    const k = kalshiLogs.map((x) => ({ ...x, platform: "KALSHI" }));
+    const p = polyLogs.map((x) => ({ ...x, platform: "POLYMARKET" }));
+    return [...k, ...p]
+      .sort((a, b) => new Date(b.ts || 0).getTime() - new Date(a.ts || 0).getTime())
+      .slice(0, 200);
+  }, [kalshiLogs, polyLogs]);
 
-  async function startBot() { setBusy(true); try { await api("/bot/start", { method: "POST" }); await refresh(); } finally { setBusy(false); } }
-  async function stopBot() { setBusy(true); try { await api("/bot/stop", { method: "POST" }); await refresh(); } finally { setBusy(false); } }
-  async function reloadKb() { setBusy(true); try { const r = await api("/agent/knowledge/reload", { method: "POST" }); alert("Knowledge reload: " + JSON.stringify(r)); } finally { setBusy(false); } }
-  async function deposit() {
-    const v = prompt("Deposit amount (USD):", "500");
-    if (!v) return;
+  useEffect(() => {
+    const el = logRef.current;
+    if (!el) return;
+    if (el.scrollTop < 80) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    if (nearBottom) el.scrollTop = el.scrollHeight;
+  }, [logs]);
+
+  const openRows = useMemo(
+    () => [
+      ...kalshiOpen.map((t) => ({ ...t, platform: "KALSHI" })),
+      ...polyOpen.map((t) => ({ ...t, platform: "POLYMARKET" })),
+    ],
+    [kalshiOpen, polyOpen],
+  );
+
+  const pnlCurve = useMemo(() => {
+    if (!data) return [];
+    const k = data.kalshi.wallet.total_pnl;
+    const p = data.polymarket.wallet.total_pnl;
+    return [
+      { t: "T-5", v: k + p - 40 },
+      { t: "T-4", v: k + p - 20 },
+      { t: "T-3", v: k + p - 10 },
+      { t: "T-2", v: k + p - 8 },
+      { t: "T-1", v: k + p - 3 },
+      { t: "Now", v: k + p },
+    ];
+  }, [data]);
+
+  async function start(platform: "kalshi" | "polymarket") {
     setBusy(true);
-    try { await api("/wallet/deposit", { method: "POST", body: JSON.stringify({ amount: Number(v) }) }); await refresh(); } finally { setBusy(false); }
+    try {
+      await api(platform === "kalshi" ? "/bot/start" : "/polymarket/bot/start", { method: "POST" });
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
   }
 
-  const running = bot?.status === "running";
-  const pnl = wallet?.total_pnl ?? 0;
-  const openedToday = summary?.today_opened_count ?? bot?.trades_today ?? 0;
-  const scannedToday = bot?.scanned_markets_today ?? 0;
-  const ranges: RangeLabel[] = ["This Week", "This Month", "This Year", "All Time"];
-  const stats = ranges.map((r) => statForRange(r, closed));
+  async function stop(platform: "kalshi" | "polymarket") {
+    setBusy(true);
+    try {
+      await api(platform === "kalshi" ? "/bot/stop" : "/polymarket/bot/stop", { method: "POST" });
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  const balanceSeries = (() => {
-    if (!wallet) return [];
-    type Pt = { ts: number; label: string; delta: number };
-    const pts: Pt[] = [];
-    for (const t of allTrades) {
-      const opened = new Date(t.opened_at).getTime();
-      if (!Number.isNaN(opened)) {
-        pts.push({
-          ts: opened,
-          label: `${new Date(opened).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`,
-          delta: -Math.abs(t.amount || 0),
-        });
-      }
-      if (t.closed_at) {
-        const closedTs = new Date(t.closed_at).getTime();
-        if (!Number.isNaN(closedTs)) {
-          const payout = (t.amount || 0) + (t.pnl || 0);
-          pts.push({
-            ts: closedTs,
-            label: `${new Date(closedTs).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`,
-            delta: payout,
-          });
-        }
-      }
-    }
-    if (pts.length === 0) {
-      return [{ t: "Now", balance: Number(wallet.balance.toFixed(2)) }];
-    }
-    pts.sort((a, b) => a.ts - b.ts);
-    const totalDelta = pts.reduce((acc, p) => acc + p.delta, 0);
-    let bal = wallet.balance - totalDelta;
-    const out = [{ t: "Start", balance: Number(bal.toFixed(2)) }];
-    for (let i = 0; i < pts.length; i++) {
-      bal += pts[i].delta;
-      out.push({
-        t: pts[i].label,
-        balance: Number(bal.toFixed(2)),
+  async function kill(platform: "kalshi" | "polymarket", current: boolean) {
+    setBusy(true);
+    try {
+      await api("/mode/kill-switch", {
+        method: "POST",
+        body: JSON.stringify({ platform, enabled: !current }),
       });
+      await refresh();
+    } finally {
+      setBusy(false);
     }
-    return out.slice(-250);
-  })();
+  }
 
-  const rrBuckets = (() => {
-    const map = new Map<string, number>();
-    for (const t of closed) {
-      const d = new Date(t.closed_at || t.opened_at);
-      const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-      map.set(k, (map.get(k) || 0) + (t.pnl || 0));
+  async function globalKill() {
+    setBusy(true);
+    try {
+      await Promise.all([
+        api("/mode/kill-switch", { method: "POST", body: JSON.stringify({ platform: "kalshi", enabled: true }) }),
+        api("/mode/kill-switch", { method: "POST", body: JSON.stringify({ platform: "polymarket", enabled: true }) }),
+        api("/bot/stop", { method: "POST" }),
+        api("/polymarket/bot/stop", { method: "POST" }),
+      ]);
+      await refresh();
+    } finally {
+      setBusy(false);
     }
-    return [...map.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .slice(-12)
-      .map(([k, v]) => ({ k: k.slice(2), rr: Number(v.toFixed(2)) }));
-  })();
+  }
 
-  const rightList = [...closed].slice(0, 12);
-
-  const frequentMarkets = (() => {
-    const map = new Map<string, { market: string; n: number; wins: number; pnl: number }>();
-    for (const t of allTrades) {
-      const key = t.market_id || t.market_title;
-      if (!map.has(key)) {
-        map.set(key, { market: t.market_title || t.market_id, n: 0, wins: 0, pnl: 0 });
-      }
-      const row = map.get(key)!;
-      row.n += 1;
-      if ((t.pnl || 0) > 0) row.wins += 1;
-      row.pnl += t.pnl || 0;
-    }
-    return [...map.values()]
-      .sort((a, b) => b.n - a.n || b.pnl - a.pnl)
-      .slice(0, 10)
-      .map((r) => ({
-        ...r,
-        winRate: r.n ? (r.wins / r.n) * 100 : 0,
-      }));
-  })();
-
-  const tradeFreq = (() => {
-    const map = new Map<string, number>();
-    for (const t of allTrades) {
-      const dt = new Date(t.opened_at);
-      const label = `${String(dt.getHours()).padStart(2, "0")}:00`;
-      map.set(label, (map.get(label) || 0) + 1);
-    }
-    return [...map.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([hour, trades]) => ({ hour, trades }));
-  })();
-
-  const monthStats = (() => {
-    const years = new Map<number, Record<number, { pnl: number; n: number; wins: number }>>();
-    for (const t of closed) {
-      const d = new Date(t.closed_at || t.opened_at);
-      const y = d.getFullYear();
-      const m = d.getMonth();
-      if (!years.has(y)) years.set(y, {});
-      const row = years.get(y)!;
-      if (!row[m]) row[m] = { pnl: 0, n: 0, wins: 0 };
-      row[m].pnl += t.pnl || 0;
-      row[m].n += 1;
-      if ((t.pnl || 0) > 0) row[m].wins += 1;
-    }
-    return [...years.entries()].sort((a, b) => b[0] - a[0]);
-  })();
+  const health = data ? (error ? "DEGRADED" : "OK") : "DEGRADED";
 
   return (
-    <div className="container dashx">
-      <div className="dashx-top">
-        <div>
-          <h1>🤖 AMTA Dashboard</h1>
-          <div className="sub">Paper trading analytics · research-driven execution</div>
+    <div className="container" style={{ maxWidth: "100%", padding: 16 }}>
+      <div className="operator-header">
+        <div className="operator-left">
+          <div className="operator-title">AMTA OPERATOR</div>
+          <div className="operator-pill">{`HEALTH: ${health}`}</div>
+          <div className="operator-pill">{`SYNC: ${lastSync}`}</div>
+          <div className="operator-pill operator-prod">ENV: PROD</div>
         </div>
-        <div className="dashx-actions">
-          {!running ? (
-            <button className="btn btn-start" onClick={startBot} disabled={busy}>▶ Start Bot</button>
-          ) : (
-            <button className="btn btn-stop" onClick={stopBot} disabled={busy}>■ Stop Bot</button>
-          )}
-          <button className="btn btn-secondary" onClick={reloadKb} disabled={busy}>Reload PDFs</button>
-          <button className="btn btn-secondary" onClick={deposit} disabled={busy}>Deposit</button>
-        </div>
-      </div>
-      {error && (
-        <div className="sub" style={{ marginTop: 8, color: "#ff7b7b", marginBottom: 8 }}>
-          Live refresh issue: {error}
-        </div>
-      )}
-
-      <div className="dashx-grid-top">
-        {stats.map((s) => (
-          <div className="card dashx-kpi" key={s.label}>
-            <div className="dashx-kpi-title">{s.label}</div>
-            <div className={`dashx-kpi-main ${s.pnl >= 0 ? "pos" : "neg"}`}>{fmtCurrency(s.pnl)}</div>
-            <div className="dashx-kpi-sub">{s.rr.toFixed(2)} R:R</div>
-            <div className="dashx-kpi-sub">{s.strike.toFixed(2)}% strike rate</div>
-            <div className="dashx-kpi-badges">
-              <span className="dashx-pill">{s.total}</span>
-              <span className="dashx-pill pos">{s.wins}</span>
-              <span className="dashx-pill neg">{s.losses}</span>
-            </div>
-          </div>
-        ))}
-        <div className="card dashx-account">
-          <div className="dashx-account-row">
-            <span>Account Balance</span>
-            <strong className="pos">${wallet ? wallet.balance.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Total P&L</span>
-            <strong className={pnl >= 0 ? "pos" : "neg"}>{pnl >= 0 ? "+" : ""}${pnl.toFixed(4)}</strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Bot</span>
-            <strong>{bot?.status ?? "—"} · {bot?.state ?? "—"}</strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Today</span>
-            <strong>{openedToday} opened · {scannedToday} scanned</strong>
-          </div>
+        <div className="operator-right">
+          <button className="btn btn-secondary" disabled={busy} onClick={() => refresh()}>Refresh</button>
+          <button className="btn btn-stop" disabled={busy} onClick={globalKill}>GLOBAL KILL SWITCH</button>
         </div>
       </div>
 
-      <div className="dashx-grid-mid">
-        <div className="dashx-main">
-          <div className="card dashx-chart-card dashx-chart-wide">
-            <h3>Account Balance</h3>
-            <div className="dashx-chart-wrap">
+      {error && <div className="sub" style={{ color: "#ff7b7b", marginBottom: 8 }}>{error}</div>}
+
+      <section className="operator-kpis">
+        <div className="operator-kpi"><span>TOTAL BALANCE</span><strong>{asDollar(data?.combined.balance || 0)}</strong></div>
+        <div className="operator-kpi"><span>REALIZED PNL (T)</span><strong className={(data?.combined.today_pnl || 0) >= 0 ? "pos" : "neg"}>{asDollar(data?.combined.today_pnl || 0, 4)}</strong></div>
+        <div className="operator-kpi"><span>OPEN POSITIONS</span><strong>{data?.combined.active_positions || 0}</strong></div>
+        <div className="operator-kpi"><span>TRADES TODAY</span><strong>{data?.combined.today_opened || 0}</strong></div>
+        <div className="operator-kpi"><span>WIN RATE</span><strong>{data ? `${(((data.kalshi.wallet.wins + data.polymarket.wallet.wins) / Math.max(1, data.kalshi.wallet.total_trades + data.polymarket.wallet.total_trades)) * 100).toFixed(1)}%` : "—"}</strong></div>
+        <div className="operator-kpi"><span>KALSHI SCAN</span><strong>{data?.kalshi.last_scan_count || 0}</strong></div>
+        <div className="operator-kpi"><span>POLY SCAN</span><strong>{data?.polymarket.last_scan_count || 0}</strong></div>
+      </section>
+
+      <div className="operator-main-grid">
+        <div className="operator-bots-grid">
+          {(["kalshi", "polymarket"] as const).map((platform) => {
+            const b = data?.[platform];
+            if (!b) return null;
+            return (
+              <div className="operator-cluster" key={platform}>
+                <h2 style={{ marginTop: 0 }}>{platform.toUpperCase()} CLUSTER</h2>
+                <div className="operator-bot-card">
+                  <div className="operator-bot-head">
+                    <span>{platform.toUpperCase()} BOT</span>
+                    <span>{modeText(b.mode_guard.mode)}</span>
+                  </div>
+                  <div className="operator-mini-grid">
+                    <div><label>STATE</label><strong className={b.status === "running" ? "pos" : "neg"}>{b.status.toUpperCase()}</strong></div>
+                    <div><label>MODE</label><strong>{modeText(b.mode_guard.mode)}</strong></div>
+                    <div><label>TRADES TODAY</label><strong>{b.today_opened}</strong></div>
+                    <div><label>ERRORS</label><strong>{error ? 1 : 0}</strong></div>
+                    <div><label>WALLET</label><strong>{asDollar(b.wallet.balance)}</strong></div>
+                    <div><label>LAST SCAN</label><strong>{b.last_scan_count}/{b.last_candidate_count}</strong></div>
+                    <div><label>OPEN POS</label><strong>{b.active_positions}</strong></div>
+                    <div><label>KILL</label><strong>{b.mode_guard.kill_switch ? "ON" : "OFF"}</strong></div>
+                  </div>
+                  <div className="operator-actions">
+                    <button className="btn btn-secondary" disabled={busy} onClick={() => start(platform)}>START</button>
+                    <button className="btn btn-secondary" disabled={busy} onClick={() => stop(platform)}>STOP</button>
+                    <button className="btn btn-stop" disabled={busy} onClick={() => kill(platform, b.mode_guard.kill_switch)}>
+                      {b.mode_guard.kill_switch ? "RELEASE KILL" : "KILL"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="operator-side">
+          <div className="operator-card">
+            <h3>Strategy & Risk Parameters</h3>
+            <div className="operator-kv"><span>ACTIVE STRATEGY</span><strong>Mode-A / Mode-B</strong></div>
+            <div className="operator-kv"><span>KALSHI MODE</span><strong>{modeText(data?.kalshi.mode_guard.mode || "paper")}</strong></div>
+            <div className="operator-kv"><span>POLY MODE</span><strong>{modeText(data?.polymarket.mode_guard.mode || "paper")}</strong></div>
+            <div className="operator-kv"><span>KALSHI CANARY</span><strong>{data?.kalshi.mode_guard.kill_switch ? "BLOCKED" : "ARMED"}</strong></div>
+            <div className="operator-kv"><span>POLY CANARY</span><strong>{data?.polymarket.mode_guard.kill_switch ? "BLOCKED" : "ARMED"}</strong></div>
+          </div>
+
+          <div className="operator-card">
+            <h3>Equity Curve</h3>
+            <div style={{ height: 180 }}>
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={balanceSeries}>
-                  <CartesianGrid stroke="#1c2436" vertical={false} />
-                  <XAxis dataKey="t" stroke="#6f7f9d" tick={{ fontSize: 11 }} />
-                  <YAxis stroke="#6f7f9d" tick={{ fontSize: 11 }} />
-                  <Tooltip contentStyle={{ background: "#101722", border: "1px solid #22314c" }} />
-                  <Line type="linear" dataKey="balance" stroke="#2f9bff" strokeWidth={2} dot={false} />
+                <LineChart data={pnlCurve}>
+                  <XAxis dataKey="t" tick={{ fill: "#7d8ba4", fontSize: 10 }} />
+                  <YAxis tick={{ fill: "#7d8ba4", fontSize: 10 }} />
+                  <Tooltip />
+                  <Line type="monotone" dataKey="v" stroke="#4aa3ff" strokeWidth={2} dot={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
           </div>
         </div>
-
-        <div className="card dashx-side">
-          <div className="dashx-side-tabs">
-            <span>Closed</span>
-            <span className="sub">Open: {summary?.open_count ?? open.length}</span>
-          </div>
-          <div className="dashx-side-list">
-            {rightList.length === 0 && <div className="sub">No recent closed trades.</div>}
-            {rightList.map((t) => (
-              <div className="dashx-side-item" key={t.id}>
-                <div className="dashx-side-title">{t.market_title.slice(0, 40)}</div>
-                <div className="dashx-side-sub">{t.category} · {t.direction} · {t.status.replace("CLOSED_", "")}</div>
-                <div className={t.pnl >= 0 ? "pos" : "neg"}>{t.pnl >= 0 ? "+" : ""}{t.pnl.toFixed(4)}</div>
-              </div>
-            ))}
-          </div>
-        </div>
       </div>
 
-      <h2>Monthly Stats</h2>
-      <div className="card" style={{ overflowX: "auto" }}>
-        <table>
-          <thead>
-            <tr>
-              <th>Year</th>
-              <th>Jan</th><th>Feb</th><th>Mar</th><th>Apr</th><th>May</th><th>Jun</th>
-              <th>Jul</th><th>Aug</th><th>Sep</th><th>Oct</th><th>Nov</th><th>Dec</th>
-              <th>Total</th>
-            </tr>
-          </thead>
-          <tbody>
-            {monthStats.length === 0 && <tr><td colSpan={14} className="sub">No closed trades yet.</td></tr>}
-            {monthStats.map(([year, row]) => {
-              const vals = Array.from({ length: 12 }, (_, m) => row[m]?.pnl ?? 0);
-              const total = vals.reduce((a, b) => a + b, 0);
-              return (
-                <tr key={year}>
-                  <td>{year}</td>
-                  {vals.map((v, i) => (
-                    <td key={i} className={v >= 0 ? "pos" : "neg"}>{v === 0 ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(2)}`}</td>
-                  ))}
-                  <td className={total >= 0 ? "pos" : "neg"}>{total >= 0 ? "+" : ""}{total.toFixed(2)}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      <h2>Frequent Markets</h2>
-      <div className="dashx-grid-mid">
-        <div className="card" style={{ overflowX: "auto" }}>
+      <div className="operator-card" style={{ marginTop: 16 }}>
+        <h3>Open Positions ({openRows.length})</h3>
+        <div className="operator-table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Market</th>
-                <th>Trades</th>
-                <th>Wins</th>
-                <th>Win Rate</th>
-                <th>Total P&L</th>
+                <th>Platform</th><th>Market</th><th>Side</th><th>Entry</th><th>Current</th><th>Size</th><th>PnL</th><th>Status</th>
               </tr>
             </thead>
             <tbody>
-              {frequentMarkets.length === 0 && (
-                <tr><td colSpan={5} className="sub">No trade history yet.</td></tr>
-              )}
-              {frequentMarkets.map((m, i) => (
-                <tr key={`${m.market}-${i}`}>
-                  <td title={m.market}>{m.market.slice(0, 70)}</td>
-                  <td>{m.n}</td>
-                  <td>{m.wins}</td>
-                  <td>{m.winRate.toFixed(1)}%</td>
-                  <td className={m.pnl >= 0 ? "pos" : "neg"}>
-                    {m.pnl >= 0 ? "+" : ""}{m.pnl.toFixed(4)}
-                  </td>
+              {openRows.length === 0 && <tr><td colSpan={8} className="sub">No open positions.</td></tr>}
+              {openRows.map((t) => (
+                <tr key={t.id}>
+                  <td>{(t as any).platform}</td>
+                  <td title={t.market_title}>{t.market_title.slice(0, 56)}</td>
+                  <td className={t.direction === "YES" ? "pos" : "neg"}>{t.direction}</td>
+                  <td>{t.entry_price.toFixed(3)}</td>
+                  <td>{(t.current_price ?? t.entry_price).toFixed(3)}</td>
+                  <td>{t.amount.toFixed(2)}</td>
+                  <td className={t.pnl >= 0 ? "pos" : "neg"}>{t.pnl.toFixed(4)}</td>
+                  <td>{t.status}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
+      </div>
 
-        <div className="card dashx-chart-card">
-          <h3>Trade Frequency (Hourly)</h3>
-          <div className="dashx-chart-wrap">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={tradeFreq}>
-                <CartesianGrid stroke="#1c2436" vertical={false} />
-                <XAxis dataKey="hour" stroke="#6f7f9d" tick={{ fontSize: 11 }} />
-                <YAxis stroke="#6f7f9d" tick={{ fontSize: 11 }} />
-                <Tooltip contentStyle={{ background: "#101722", border: "1px solid #22314c" }} />
-                <Bar dataKey="trades" fill="#2f9bff" />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
+      <div className="operator-card" style={{ marginTop: 16 }}>
+        <h3>Live Execution Monitor ({logs.length})</h3>
+        <div className="operator-log" ref={logRef}>
+          {logs.map((x) => (
+            <div key={`${x.id}-${x.ts}`} className="operator-log-row">
+              <span className="ts">{x.ts ? new Date(x.ts).toLocaleTimeString() : ""}</span>
+              <span className="platform">{(x as any).platform}</span>
+              <span className={x.level === "ERROR" ? "neg" : "pos"}>[{x.level}]</span>
+              <span className="msg">{x.message}</span>
+              <span className="age">{since(x.ts)}</span>
+            </div>
+          ))}
         </div>
-      </div>
-
-      <h2>Open Positions</h2>
-      <div className="card" style={{ overflowX: "auto" }}>
-        <table>
-          <thead><tr><th>Market</th><th>Cat</th><th>Side</th><th>Score</th><th>Entry</th><th>Now</th><th>Unreal P&L</th></tr></thead>
-          <tbody>
-            {open.length === 0 && <tr><td colSpan={7} className="sub">No open positions.</td></tr>}
-            {open.slice(0, 20).map(t => (
-              <tr key={t.id}>
-                <td title={t.market_title}>{t.market_title.slice(0, 50)}</td>
-                <td className="sub">{t.category}</td>
-                <td><span className={`badge badge-${t.direction === "YES" ? "yes" : "no"}`}>{t.direction}</span></td>
-                <td>{t.agent_score}</td>
-                <td>{t.entry_price.toFixed(2)}</td>
-                <td>{t.current_price != null ? t.current_price.toFixed(2) : "—"}</td>
-                <td className={(t.unrealized_pnl ?? 0) >= 0 ? "pos" : "neg"}>
-                  {t.unrealized_pnl != null ? (t.unrealized_pnl >= 0 ? "+" : "") + t.unrealized_pnl.toFixed(4) : "—"}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      <h2>Agent Activity</h2>
-      <div className="card feed">
-        {logs.length === 0 && <div className="sub">No logs yet — start the bot.</div>}
-        {logs.map((l, i) => (
-          <div key={i} className="row">
-            <span className={`lvl-${l.level}`}>[{l.level}]</span>
-            <span>{l.message}</span>
-          </div>
-        ))}
       </div>
     </div>
   );

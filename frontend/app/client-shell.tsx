@@ -2,11 +2,13 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
+import { usePathname } from "next/navigation";
 
 const PASSCODE = "9472";
 const SESSION_KEY = "amta_auth_ok";
 
 export default function ClientShell({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
   const [ready, setReady] = useState(false);
   const [unlocked, setUnlocked] = useState(false);
   const [pin, setPin] = useState("");
@@ -78,24 +80,70 @@ export default function ClientShell({ children }: { children: React.ReactNode })
     );
   }
 
+  const tabs = [
+    { href: "/", label: "Dashboard", short: "HOME" },
+    { href: "/kalshi", label: "Kalshi Paper", short: "K-PAPER" },
+    { href: "/bots", label: "Kalshi Live", short: "K-LIVE" },
+    { href: "/polymarket", label: "Polymarket Paper", short: "P-PAPER" },
+    { href: "/polymarket/live", label: "Polymarket Live", short: "P-LIVE" },
+  ];
+
+  if (pathname === "/") {
+    return (
+      <>
+        <nav className="nav">
+          <div className="nav-inner">
+            <span className="brand">AMTA</span>
+            {tabs.map((tab) => (
+              <Link key={`d-${tab.href}`} href={tab.href}>
+                {tab.label}
+              </Link>
+            ))}
+          </div>
+        </nav>
+        {children}
+      </>
+    );
+  }
+
   return (
     <>
-      <nav className="nav">
-        <div className="nav-inner">
-          <span className="brand">🤖 AMTA</span>
-          <Link href="/">Dashboard</Link>
-          <Link href="/bots">Bots</Link>
-          <Link href="/kalshi">Kalshi</Link>
-          <Link href="/polymarket">Polymarket</Link>
-          <Link href="/polymarket/live">Live Mode</Link>
-          <Link href="/daily-earnings">Daily Earnings</Link>
-          <Link href="/trades">All Trades</Link>
-          <Link href="/strategies">Strategies</Link>
-          <Link href="/quick">Quick Trade</Link>
-          <Link href="/knowledge">Knowledge</Link>
+      <header className="amta-topbar">
+        <div className="amta-topbar-inner">
+          <div className="amta-brand-wrap">
+            <span className="amta-terminal-dot" />
+            <span className="amta-brand">AMTA OPERATOR v4.2</span>
+          </div>
+          <div className="amta-pill">SECURE</div>
+        </div>
+      </header>
+
+      <nav className="amta-tabs">
+        <div className="amta-tabs-inner">
+          {tabs.map((tab) => {
+            const active = pathname === tab.href;
+            return (
+              <Link key={tab.href} href={tab.href} className={`amta-tab ${active ? "active" : ""}`}>
+                <span className="tab-full">{tab.label}</span>
+                <span className="tab-short">{tab.short}</span>
+              </Link>
+            );
+          })}
         </div>
       </nav>
-      {children}
+
+      <div className="amta-page-wrap">{children}</div>
+
+      <nav className="amta-bottom-nav">
+        {tabs.slice(0, 4).map((tab) => {
+          const active = pathname === tab.href;
+          return (
+            <Link key={`m-${tab.href}`} href={tab.href} className={`amta-bottom-item ${active ? "active" : ""}`}>
+              {tab.short}
+            </Link>
+          );
+        })}
+      </nav>
     </>
   );
 }

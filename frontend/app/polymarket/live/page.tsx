@@ -1,96 +1,121 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../../../lib/api";
+import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from "recharts";
 
-type ModeState = {
-  platform: string;
-  mode: "paper" | "live_requested" | "live_armed";
-  live_enabled: boolean;
-  kill_switch: boolean;
-  requested_at: string | null;
-  armed_at: string | null;
-  last_changed_at: string;
-  limits: Record<string, unknown>;
-};
-
-type ModeSnapshot = {
-  kalshi: ModeState;
-  polymarket: ModeState;
-};
-
-type Wallet = {
-  balance: number;
-  total_pnl: number;
-  total_trades: number;
-  wins: number;
-  losses: number;
-  win_rate: number;
-  live_error?: string | null;
-};
-
+type ModeState = { mode: "paper" | "live_requested" | "live_armed"; live_enabled: boolean; kill_switch: boolean };
+type ModeSnapshot = { polymarket: ModeState };
 type BotStatus = {
   status: string;
-  state: string;
-  active_positions: number;
   trades_today: number;
   scanned_markets_today: number;
   last_candidate_count: number;
-  mode_guard?: { mode: string; live_enabled: boolean };
+  active_positions: number;
 };
-
-type Trade = {
+type Wallet = {
+  balance: number;
+  trade_balance: number;
+  vault_balance: number;
+  actual_balance: number;
+  trade_cap_usd: number;
+  force_mode_a?: boolean;
+  live_trade_balance?: number;
+  live_vault_balance?: number;
+  live_actual_balance?: number;
+  live_trade_cap_usd?: number;
+  live_vault_sweeps_count?: number;
+  live_last_sweep_at?: string | null;
+  live_last_withdraw_at?: string | null;
+  live_withdrawn_total?: number;
+  live_auto_withdraw_enabled?: boolean;
+  total_pnl: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+};
+type Trade = { id: string; market_title: string; direction: "YES" | "NO"; amount: number; entry_price: number; current_price?: number | null; pnl: number; closed_at?: string | null };
+type LogEntry = { id: string; level: string; message: string; ts: string | null; local_ts?: string };
+type AgentLogEntry = { id?: string; level?: string; message?: string; ts?: string | null };
+type Market = { id: string; title: string; yes_price: number; no_price: number };
+type WithdrawJob = {
   id: string;
-  market_title: string;
-  direction: "YES" | "NO";
-  amount: number;
-  entry_price: number;
-  current_price?: number | null;
-  pnl: number;
+  amount_usd: number;
   status: string;
-  agent_score: number;
-  opened_at: string;
-  closed_at?: string | null;
+  tx_hash?: string | null;
+  error_message?: string | null;
+  attempts: number;
+  requested_by: string;
+  created_at?: string | null;
 };
 
-function badgeForMode(m: ModeState["mode"]) {
-  if (m === "live_armed") return { text: "🔴 LIVE ARMED", cls: "neg" };
-  if (m === "live_requested") return { text: "🟡 LIVE REQUESTED", cls: "pending" };
-  return { text: "🟢 PAPER", cls: "pos" };
+function parseTradeTime(raw?: string | null): number {
+  if (!raw) return NaN;
+  const hasTimezone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(raw);
+  const normalized = hasTimezone ? raw : `${raw}Z`;
+  const ts = new Date(normalized).getTime();
+  return Number.isFinite(ts) ? ts : NaN;
+}
+
+function formatLogTime(x: LogEntry): string {
+  const raw = x.ts ?? x.local_ts ?? null;
+  if (!raw) return "--:--:--";
+  const ts = new Date(raw).getTime();
+  if (!Number.isFinite(ts)) return "--:--:--";
+  return new Date(ts).toLocaleTimeString();
 }
 
 export default function PolymarketLivePage() {
   const [mode, setMode] = useState<ModeState | null>(null);
-  const [wallet, setWallet] = useState<Wallet | null>(null);
   const [bot, setBot] = useState<BotStatus | null>(null);
+  const [wallet, setWallet] = useState<Wallet | null>(null);
   const [openTrades, setOpenTrades] = useState<Trade[]>([]);
-  const [recentClosed, setRecentClosed] = useState<Trade[]>([]);
+  const [closedTrades, setClosedTrades] = useState<Trade[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [markets, setMarkets] = useState<Market[]>([]);
+  const [withdrawJobs, setWithdrawJobs] = useState<WithdrawJob[]>([]);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
-  const [passcode, setPasscode] = useState("");
-  const [maxOrderUsd, setMaxOrderUsd] = useState<string>("2");
-  const [maxTradesPerDay, setMaxTradesPerDay] = useState<string>("5");
-  const [maxExposureUsd, setMaxExposureUsd] = useState<string>("10");
+  const [actionMsg, setActionMsg] = useState("");
 
   async function refresh() {
-    try {
-      const [snap, w, b, openT, closedT] = await Promise.all([
-        api<ModeSnapshot>("/mode/status"),
-        api<Wallet>("/polymarket/wallet"),
-        api<BotStatus>("/polymarket/bot/status"),
-        api<Trade[]>("/polymarket/trades?status=open&limit=50&page=1"),
-        api<Trade[]>("/polymarket/trades?status=closed&limit=20&page=1"),
-      ]);
-      setMode(snap.polymarket);
-      setWallet(w);
-      setBot(b);
-      setOpenTrades(openT);
-      setRecentClosed(closedT);
-      setError(null);
-    } catch (e: any) {
-      setError(e?.message || "refresh failed");
+    const [m, b, w, o, c, l, mk, jobs] = await Promise.all([
+      api<ModeSnapshot>("/mode/status"),
+      api<BotStatus>("/polymarket/live/bot/status"),
+      api<Wallet>("/polymarket/live/wallet"),
+      api<Trade[]>("/polymarket/trades?mode=live&status=open&limit=20&page=1"),
+      api<Trade[]>("/polymarket/trades?mode=live&status=closed&limit=300&page=1"),
+      api<LogEntry[]>("/polymarket/logs?mode=live&limit=300"),
+      api<Market[]>("/polymarket/markets?limit=10"),
+      api<WithdrawJob[]>("/polymarket/live/vault/withdraw-jobs?limit=20"),
+    ]);
+    setMode(m.polymarket);
+    setBot(b);
+    setWallet(w);
+    setOpenTrades(o);
+    setClosedTrades(c);
+    const nowIso = new Date().toISOString();
+    if (Array.isArray(l) && l.length > 0) {
+      setLogs(l.map((x) => ({ ...x, local_ts: x.ts ?? nowIso })));
+    } else {
+      // Fallback for environments where mode-scoped logs are not persisted.
+      try {
+        const fallback = await api<AgentLogEntry[]>("/agent/logs?limit=300");
+        const mapped: LogEntry[] = (fallback || [])
+          .filter((x) => (x.message || "").toLowerCase().includes("polymarket"))
+          .map((x, i) => ({
+            id: String(x.id ?? `fallback-${i}`),
+            level: String(x.level ?? "INFO"),
+            message: String(x.message ?? ""),
+            ts: x.ts ?? null,
+            local_ts: x.ts ?? nowIso,
+          }));
+        setLogs(mapped);
+      } catch {
+        setLogs([]);
+      }
     }
+    setMarkets(mk);
+    setWithdrawJobs(jobs);
   }
 
   useEffect(() => {
@@ -99,435 +124,346 @@ export default function PolymarketLivePage() {
     return () => clearInterval(id);
   }, []);
 
-  function flash(msg: string) {
-    setInfo(msg);
-    setTimeout(() => setInfo(null), 3500);
-  }
-
-  async function requestLive() {
+  async function start() {
     setBusy(true);
     try {
-      await api("/mode/request-live", {
-        method: "POST",
-        body: JSON.stringify({ platform: "polymarket" }),
-      });
-      flash("Live mode requested. Enter passcode and confirm.");
+      await api("/polymarket/live/bot/start", { method: "POST" });
+      setActionMsg("Live bot started.");
       await refresh();
-    } catch (e: any) {
-      alert("Request failed: " + e.message);
-    } finally {
-      setBusy(false);
-    }
+    } finally { setBusy(false); }
   }
-
-  async function confirmLive() {
-    if (!passcode) {
-      alert("Enter passcode first");
-      return;
-    }
+  async function stop() {
     setBusy(true);
     try {
-      const limits: Record<string, number> = {};
-      const a = parseFloat(maxOrderUsd);
-      const b = parseInt(maxTradesPerDay, 10);
-      const c = parseFloat(maxExposureUsd);
-      if (!Number.isNaN(a)) limits.max_order_usd = a;
-      if (!Number.isNaN(b)) limits.max_new_trades_per_day = b;
-      if (!Number.isNaN(c)) limits.max_total_exposure_usd = c;
-      await api("/mode/confirm-live", {
-        method: "POST",
-        body: JSON.stringify({ platform: "polymarket", passcode, limits }),
-      });
-      setPasscode("");
-      flash("Live mode armed. Bot will trade real USDC.");
+      await api("/polymarket/live/bot/stop", { method: "POST" });
+      setActionMsg("Live bot stopped.");
       await refresh();
-    } catch (e: any) {
-      alert("Confirm failed: " + e.message);
-    } finally {
-      setBusy(false);
-    }
+    } finally { setBusy(false); }
   }
-
-  async function disarm() {
-    if (!confirm("Disarm live mode and switch back to paper?")) return;
-    setBusy(true);
-    try {
-      await api("/mode/set-paper", {
-        method: "POST",
-        body: JSON.stringify({ platform: "polymarket" }),
-      });
-      flash("Switched to paper mode.");
-      await refresh();
-    } catch (e: any) {
-      alert("Disarm failed: " + e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function toggleKillSwitch() {
+  async function killToggle() {
     if (!mode) return;
-    const next = !mode.kill_switch;
-    if (next && !confirm("Enable kill switch? This stops all new trades and forces paper mode.")) return;
     setBusy(true);
     try {
-      await api("/mode/kill-switch", {
-        method: "POST",
-        body: JSON.stringify({ platform: "polymarket", enabled: next }),
-      });
-      flash(next ? "Kill switch ENABLED." : "Kill switch disabled.");
+      await api("/mode/kill-switch", { method: "POST", body: JSON.stringify({ platform: "polymarket", enabled: !mode.kill_switch }) });
+      setActionMsg(!mode.kill_switch ? "Kill switch enabled." : "Kill switch disabled.");
       await refresh();
-    } catch (e: any) {
-      alert("Kill switch failed: " + e.message);
-    } finally {
-      setBusy(false);
-    }
+    } finally { setBusy(false); }
+  }
+  async function setLiveVaultCap() {
+    const passcode = prompt("Passcode", "9472");
+    if (!passcode) return;
+    const cap = prompt("Live trade cap USD", String(wallet?.live_trade_cap_usd ?? 30));
+    if (!cap) return;
+    setBusy(true);
+    try {
+      await api("/polymarket/live/vault/set-cap", { method: "POST", body: JSON.stringify({ passcode, cap_usd: Number(cap) }) });
+      setActionMsg(`Live cap set to $${Number(cap).toFixed(2)}.`);
+      await refresh();
+    } finally { setBusy(false); }
+  }
+  async function manualWithdraw() {
+    const passcode = prompt("Passcode", "9472");
+    if (!passcode) return;
+    const amount = prompt("Withdraw amount USD (blank = auto amount)", "");
+    setBusy(true);
+    try {
+      await api("/polymarket/live/vault/withdraw", { method: "POST", body: JSON.stringify({ passcode, amount_usd: amount ? Number(amount) : null, requested_by: "manual" }) });
+      setActionMsg("Withdraw request submitted.");
+      await refresh();
+    } finally { setBusy(false); }
+  }
+  async function toggleAutoWithdraw() {
+    const passcode = prompt("Passcode", "9472");
+    if (!passcode) return;
+    setBusy(true);
+    try {
+      await api("/polymarket/live/vault/auto-withdraw/toggle", { method: "POST", body: JSON.stringify({ passcode, enabled: !wallet?.live_auto_withdraw_enabled }) });
+      setActionMsg(`Auto-withdraw ${wallet?.live_auto_withdraw_enabled ? "disabled" : "enabled"}.`);
+      await refresh();
+    } finally { setBusy(false); }
+  }
+  async function unlockToTrade() {
+    const passcode = prompt("Passcode", "9472");
+    if (!passcode) return;
+    const amount = prompt("Unlock amount USD", "1");
+    if (!amount) return;
+    setBusy(true);
+    try {
+      await api("/polymarket/live/vault/unlock-to-trade", { method: "POST", body: JSON.stringify({ passcode, amount: Number(amount) }) });
+      setActionMsg(`Unlocked $${Number(amount).toFixed(2)} to live trade balance.`);
+      await refresh();
+    } finally { setBusy(false); }
   }
 
-  async function startBot() {
-    setBusy(true);
-    try {
-      await api("/polymarket/bot/start", { method: "POST" });
-      await refresh();
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function stopBot() {
-    setBusy(true);
-    try {
-      await api("/polymarket/bot/stop", { method: "POST" });
-      await refresh();
-    } finally {
-      setBusy(false);
-    }
-  }
+  const modeLabel = useMemo(() => {
+    return "LIVE";
+  }, []);
+  const liveTradeBalance =
+    (wallet?.trade_balance ?? wallet?.balance ?? 0) > 0
+      ? (wallet?.trade_balance ?? wallet?.balance ?? 0)
+      : (wallet?.live_trade_balance ?? wallet?.trade_balance ?? wallet?.balance ?? 0);
+  const liveTotalBalance =
+    (wallet?.actual_balance ?? wallet?.balance ?? 0) > 0
+      ? (wallet?.actual_balance ?? wallet?.balance ?? 0)
+      : (wallet?.live_actual_balance ?? wallet?.actual_balance ?? wallet?.balance ?? 0);
+  const strategy = useMemo(() => {
+    if (wallet?.force_mode_a) return "MODE-A";
+    return (liveTradeBalance >= 5 ? "MODE-B" : "MODE-A");
+  }, [wallet?.force_mode_a, liveTradeBalance]);
+  const running = bot?.status === "running";
+  const wins = wallet?.wins ?? 0;
+  const losses = wallet?.losses ?? 0;
+  const winRate = wins + losses > 0 ? (wins / (wins + losses)) * 100 : wallet?.win_rate ?? 0;
 
-  const badge = mode ? badgeForMode(mode.mode) : null;
-  const isLive = mode?.mode === "live_armed";
-  const isRequested = mode?.mode === "live_requested";
-  const botRunning = bot?.status === "running";
+  const todayPnlSeries = useMemo(() => {
+    const now = new Date();
+    const day = now.getDate();
+    const month = now.getMonth();
+    const year = now.getFullYear();
+    const rows = closedTrades
+      .map((t) => ({ t, ts: parseTradeTime(t.closed_at) }))
+      .filter((row) => {
+        if (!Number.isFinite(row.ts)) return false;
+        const d = new Date(row.ts);
+        return d.getDate() === day && d.getMonth() === month && d.getFullYear() === year;
+      })
+      .sort((a, b) => a.ts - b.ts)
+      .map((row) => row.t);
+
+    const fallbackRows = closedTrades
+      .map((t) => ({ t, ts: parseTradeTime(t.closed_at) }))
+      .filter((row) => Number.isFinite(row.ts))
+      .sort((a, b) => a.ts - b.ts)
+      .slice(-24)
+      .map((row) => row.t);
+
+    const source = rows.length >= 2 ? rows : fallbackRows;
+    if (!source.length) {
+      return [{ x: 1, label: "now", pnl: Number((wallet?.total_pnl ?? 0).toFixed(4)) }];
+    }
+    let running = 0;
+    return source.map((t, i) => {
+      const ts = parseTradeTime(t.closed_at);
+      running += Number(t.pnl || 0);
+      return {
+        x: i + 1,
+        label: Number.isFinite(ts) ? new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "--",
+        pnl: Number(running.toFixed(4)),
+      };
+    });
+  }, [closedTrades, wallet?.total_pnl]);
+  const monthPnlSeries = useMemo(() => {
+    const now = new Date();
+    const rows = closedTrades
+      .filter((t) => {
+        const ts = parseTradeTime(t.closed_at);
+        if (!Number.isFinite(ts)) return false;
+        const d = new Date(ts);
+        return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+      })
+      .sort((a, b) => parseTradeTime(a.closed_at) - parseTradeTime(b.closed_at));
+    if (!rows.length) {
+      return [{ x: 1, label: "now", pnl: Number((wallet?.total_pnl ?? 0).toFixed(4)) }];
+    }
+    let running = 0;
+    return rows.map((t, i) => {
+      const ts = parseTradeTime(t.closed_at);
+      const d = Number.isFinite(ts) ? new Date(ts) : null;
+      running += Number(t.pnl || 0);
+      return { x: i + 1, label: d ? `${d.getDate()}/${d.getMonth() + 1}` : "--", pnl: Number(running.toFixed(4)) };
+    });
+  }, [closedTrades, wallet?.total_pnl]);
+  const [todayMin, todayMax] = useMemo(() => {
+    if (!todayPnlSeries.length) return [-1, 1];
+    const vals = todayPnlSeries.map((r) => r.pnl);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const pad = Math.max(0.5, (max - min) * 0.2);
+    return [min - pad, max + pad];
+  }, [todayPnlSeries]);
+  const [monthMin, monthMax] = useMemo(() => {
+    if (!monthPnlSeries.length) return [-1, 1];
+    const vals = monthPnlSeries.map((r) => r.pnl);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const pad = Math.max(0.5, (max - min) * 0.2);
+    return [min - pad, max + pad];
+  }, [monthPnlSeries]);
 
   return (
-    <div className="container dashx">
-      <div className="dashx-top">
-        <div>
-          <h1>🔴 Polymarket Live Mode</h1>
-          <div className="sub">Arm, monitor, and disarm real-money trading on Polymarket</div>
-        </div>
-        <div className="dashx-actions">
-          {badge && (
-            <span className={`dashx-hero-badge ${badge.cls}`} style={{ fontSize: 14, padding: "6px 12px" }}>
-              <span className="dot" />
-              {badge.text}
-            </span>
-          )}
-          {!botRunning ? (
-            <button className="btn btn-start" onClick={startBot} disabled={busy}>▶ Start Bot</button>
-          ) : (
-            <button className="btn btn-stop" onClick={stopBot} disabled={busy}>■ Stop Bot</button>
-          )}
-          <button className="btn btn-secondary" onClick={refresh} disabled={busy}>Refresh</button>
-        </div>
-      </div>
-
-      {error && (
-        <div className="sub" style={{ marginTop: 8, color: "#ff7b7b", marginBottom: 8 }}>
-          Refresh issue: {error}
-        </div>
-      )}
-      {info && (
-        <div className="sub" style={{ marginTop: 8, color: "#7bff9b", marginBottom: 8 }}>
-          {info}
-        </div>
-      )}
-
-      <div className="dashx-hero-row">
-        <div className="card dashx-hero">
-          <div className="dashx-hero-label">Live Wallet (USDC)</div>
-          <div className="dashx-hero-value">
-            {isLive ? `$${(wallet?.balance ?? 0).toFixed(2)}` : "—"}
-            <span className="dashx-hero-delta muted">
-              {isLive ? "on-chain CLOB" : "arm to view"}
-            </span>
+    <div style={{ minHeight: "100vh", background: "#10131a", color: "#e0e2ec" }}>
+      <div className="container" style={{ maxWidth: 1480, paddingTop: 12, paddingBottom: 24 }}>
+        <div className="card" style={{ marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, background: "linear-gradient(135deg, rgba(47,155,255,0.12), rgba(117,76,255,0.08) 45%, rgba(11,16,28,0.8))", border: "1px solid #2a3f68" }}>
+          <div>
+            <h1 style={{ margin: 0 }}>AMTA OPERATOR v4.2</h1>
+            <div className="sub">Polymarket Live Bot</div>
+            <div style={{ marginTop: 4, fontSize: 12, color: running ? "#63ffbe" : "#9fb2d3", display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: running ? "#63ffbe" : "#60708f", marginRight: 2, boxShadow: running ? "0 0 10px #63ffbe" : "none" }} />
+              {running ? "ENGINE RUNNING" : "ENGINE IDLE"} · {modeLabel}
+            </div>
+            {actionMsg && <div style={{ marginTop: 4, fontSize: 12, color: "#8bc1ff" }}>{actionMsg}</div>}
           </div>
-          {wallet?.live_error && (
-            <div className="sub" style={{ color: "#ff7b7b", marginTop: 4 }}>{wallet.live_error}</div>
-          )}
-        </div>
-
-        <div className="card dashx-hero">
-          <div className="dashx-hero-label">Active Live Positions</div>
-          <div className="dashx-hero-value">
-            {isLive ? (bot?.active_positions ?? 0) : 0}
-            <span className="dashx-hero-delta muted">
-              {bot?.last_candidate_count ?? 0} candidates
-            </span>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            <button className="btn btn-start" disabled={busy || running} onClick={start}>Start</button>
+            <button className="btn btn-stop" disabled={busy || !running} onClick={stop}>Stop</button>
+            <button className="btn btn-secondary" disabled={busy} onClick={refresh}>Refresh</button>
+            <button className="btn btn-stop" disabled={busy} onClick={killToggle}>{mode?.kill_switch ? "Disable Kill" : "Enable Kill"}</button>
           </div>
         </div>
 
-        <div className="card dashx-hero">
-          <div className="dashx-hero-label">Live P&amp;L (closed)</div>
-          <div className={`dashx-hero-value ${(wallet?.total_pnl ?? 0) >= 0 ? "pos" : "neg"}`}>
-            {isLive
-              ? `${(wallet?.total_pnl ?? 0) >= 0 ? "+" : "-"}$${Math.abs(wallet?.total_pnl ?? 0).toFixed(2)}`
-              : "—"}
-            <span className="dashx-hero-delta muted">
-              {isLive ? `${wallet?.total_trades ?? 0} trades` : "arm to view"}
-            </span>
-          </div>
+        <div className="operator-kpis" style={{ display: "grid", gridTemplateColumns: "repeat(12, minmax(0, 1fr))", gap: 8, overflowX: "hidden", paddingBottom: 0 }}>
+          <div className="operator-kpi"><span>MODE</span><strong>{modeLabel}</strong></div>
+          <div className="operator-kpi"><span>TRADE BALANCE</span><strong style={{ color: "#8bc1ff" }}>${liveTradeBalance.toFixed(2)}</strong></div>
+          <div className="operator-kpi"><span>TOTAL BALANCE</span><strong style={{ color: "#63ffbe" }}>${liveTotalBalance.toFixed(2)}</strong></div>
+          <div className="operator-kpi"><span>TODAY PNL</span><strong style={{ color: (wallet?.total_pnl ?? 0) >= 0 ? "#63ffbe" : "#ff8f9a" }}>{(wallet?.total_pnl ?? 0) >= 0 ? "+" : ""}{(wallet?.total_pnl ?? 0).toFixed(2)}</strong></div>
+          <div className="operator-kpi"><span>OPEN POS</span><strong>{bot?.active_positions ?? 0}</strong></div>
+          <div className="operator-kpi"><span>TRADES TODAY</span><strong>{bot?.trades_today ?? 0}</strong></div>
+          <div className="operator-kpi"><span>WIN RATE</span><strong style={{ color: "#63ffbe" }}>{winRate.toFixed(1)}%</strong></div>
+          <div className="operator-kpi"><span>W / L</span><strong style={{ fontSize: 18, whiteSpace: "nowrap" }}><span style={{ color: "#63ffbe" }}>{wins}W</span> / <span style={{ color: "#ff8f9a" }}>{losses}L</span></strong></div>
+          <div className="operator-kpi"><span>SCANNED</span><strong>{bot?.scanned_markets_today ?? 0}</strong></div>
+          <div className="operator-kpi"><span>CANDIDATES</span><strong>{bot?.last_candidate_count ?? 0}</strong></div>
+          <div className="operator-kpi"><span>STRATEGY</span><strong style={{ color: strategy === "MODE-B" ? "#ffcf6b" : "#8bc1ff" }}>{strategy}</strong></div>
+          <div className="operator-kpi"><span>KILL SWITCH</span><strong style={{ color: mode?.kill_switch ? "#ff8f9a" : "#63ffbe" }}>{mode?.kill_switch ? "ON" : "OFF"}</strong></div>
         </div>
 
-        <div className="card dashx-hero">
-          <div className="dashx-hero-label">Win Rate (live)</div>
-          <div className="dashx-hero-value">
-            {isLive ? `${(wallet?.win_rate ?? 0).toFixed(1)}%` : "—"}
-            <span className="dashx-hero-delta muted">
-              {isLive ? `${wallet?.wins ?? 0}W / ${wallet?.losses ?? 0}L` : ""}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      <div className="dashx-grid-mid">
-        <div className="dashx-main">
-          <div className="card" style={{ padding: 16 }}>
-            <h3 style={{ marginTop: 0 }}>Arming Controls</h3>
-            {!mode?.live_enabled && (
-              <div className="sub" style={{ color: "#ffae6b", marginBottom: 12 }}>
-                ⚠ Live mode is disabled in config (POLYMARKET_LIVE_ENABLED=false).
-              </div>
-            )}
-            {mode?.kill_switch && (
-              <div className="sub" style={{ color: "#ff7b7b", marginBottom: 12 }}>
-                🛑 Kill switch is ENABLED. Disable it before arming live.
-              </div>
-            )}
-
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 12 }}>
-              <div>
-                <label className="sub">Max order USD</label>
-                <input
-                  className="input"
-                  type="number"
-                  step="0.01"
-                  value={maxOrderUsd}
-                  onChange={(e) => setMaxOrderUsd(e.target.value)}
-                  disabled={busy || isLive}
-                  style={{ width: "100%" }}
-                />
-              </div>
-              <div>
-                <label className="sub">Max new trades / day</label>
-                <input
-                  className="input"
-                  type="number"
-                  step="1"
-                  value={maxTradesPerDay}
-                  onChange={(e) => setMaxTradesPerDay(e.target.value)}
-                  disabled={busy || isLive}
-                  style={{ width: "100%" }}
-                />
-              </div>
-              <div>
-                <label className="sub">Max total exposure USD</label>
-                <input
-                  className="input"
-                  type="number"
-                  step="0.01"
-                  value={maxExposureUsd}
-                  onChange={(e) => setMaxExposureUsd(e.target.value)}
-                  disabled={busy || isLive}
-                  style={{ width: "100%" }}
-                />
+        <div className="operator-grid" style={{ marginTop: 10 }}>
+          <div className="operator-main">
+            <div className="card" style={{ paddingBottom: 12 }}>
+              <h3>REAL-TIME LOGS</h3>
+              <div style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr 1fr", gap: 10 }}>
+                <div className="operator-log" style={{ background: "#0b0f18", border: "1px solid #22314c", height: 360 }}>
+                  {logs.map((x) => (
+                    <div key={x.id} style={{ display: "grid", gridTemplateColumns: "120px 56px 1fr", gap: 10, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace", fontSize: 12, lineHeight: 1.45, padding: "2px 0", borderBottom: "1px solid rgba(34,49,76,0.25)" }}>
+                      <span style={{ color: "#90a5cc" }}>{formatLogTime(x)}</span>
+                      <span style={{ color: x.level === "ERROR" ? "#ff8f9a" : x.level === "WARNING" ? "#ffcf6b" : "#8bc1ff", fontWeight: 700 }}>{x.level}</span>
+                      <span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", color: x.message.includes("VAULT_SWEEP") ? "#ffcf6b" : "#d8e6ff", fontWeight: x.message.includes("VAULT_SWEEP") ? 700 : 400 }}>{x.message}</span>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ border: "1px solid #22314c", borderRadius: 6, background: "#0b0f18", height: 360, padding: 8 }}>
+                  <div style={{ fontSize: 12, color: "#ff7b63", marginBottom: 6 }}>Today P&amp;L line chart</div>
+                  <ResponsiveContainer width="100%" height="90%">
+                    <LineChart data={todayPnlSeries}>
+                      <CartesianGrid stroke="#1d2a44" vertical={false} />
+                      <XAxis dataKey="label" stroke="#6f86af" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
+                      <YAxis hide domain={[todayMin, todayMax]} />
+                      <Tooltip contentStyle={{ background: "#101722", border: "1px solid #22314c" }} />
+                      <Line type="linear" dataKey="pnl" stroke="#4ade80" strokeWidth={2} dot={false} connectNulls />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+                <div style={{ border: "1px solid #22314c", borderRadius: 6, background: "#0b0f18", height: 360, padding: 8 }}>
+                  <div style={{ fontSize: 12, color: "#ff7b63", marginBottom: 6 }}>Monthly P&amp;L line chart</div>
+                  <ResponsiveContainer width="100%" height="90%">
+                    <LineChart data={monthPnlSeries}>
+                      <CartesianGrid stroke="#1d2a44" vertical={false} />
+                      <XAxis dataKey="label" stroke="#6f86af" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
+                      <YAxis hide domain={[monthMin, monthMax]} />
+                      <Tooltip contentStyle={{ background: "#101722", border: "1px solid #22314c" }} />
+                      <Line type="linear" dataKey="pnl" stroke="#60a5fa" strokeWidth={2} dot={false} connectNulls />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
             </div>
 
-            {!isLive && !isRequested && (
-              <button
-                className="btn btn-stop"
-                onClick={requestLive}
-                disabled={busy || !mode?.live_enabled || !!mode?.kill_switch}
-              >
-                Request Live Mode
-              </button>
-            )}
-
-            {isRequested && (
-              <div style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
-                <div style={{ flex: "1 1 200px" }}>
-                  <label className="sub">Confirm passcode</label>
-                  <input
-                    className="input"
-                    type="password"
-                    value={passcode}
-                    onChange={(e) => setPasscode(e.target.value)}
-                    placeholder="••••"
-                    style={{ width: "100%" }}
-                    autoFocus
-                  />
-                </div>
-                <button className="btn btn-stop" onClick={confirmLive} disabled={busy || !passcode}>
-                  Arm Live
-                </button>
-                <button className="btn btn-secondary" onClick={disarm} disabled={busy}>
-                  Cancel
-                </button>
+            <div className="card" style={{ background: "linear-gradient(180deg,#101826,#0f1420)", border: "1px solid #2a3f68" }}>
+              <h3>SCAN INTELLIGENCE</h3>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4,minmax(0,1fr))", gap: 8, marginTop: 8 }}>
+                <div className="operator-kpi"><span>SCANS</span><strong style={{ color: "#8bc1ff" }}>{bot?.scanned_markets_today ?? 0}</strong></div>
+                <div className="operator-kpi"><span>CANDIDATES</span><strong style={{ color: "#ffcf6b" }}>{bot?.last_candidate_count ?? 0}</strong></div>
+                <div className="operator-kpi"><span>OPEN</span><strong style={{ color: "#63ffbe" }}>{openTrades.length}</strong></div>
+                <div className="operator-kpi"><span>CLOSED</span><strong style={{ color: "#bcbfcb" }}>{closedTrades.length}</strong></div>
               </div>
-            )}
+            </div>
 
-            {isLive && (
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button className="btn btn-secondary" onClick={disarm} disabled={busy}>
-                  Disarm (back to paper)
-                </button>
-                <button className="btn btn-stop" onClick={toggleKillSwitch} disabled={busy}>
-                  🛑 Kill Switch
-                </button>
-              </div>
-            )}
-
-            {!isLive && (
-              <div style={{ marginTop: 12 }}>
-                <button
-                  className={`btn ${mode?.kill_switch ? "btn-start" : "btn-secondary"}`}
-                  onClick={toggleKillSwitch}
-                  disabled={busy}
-                >
-                  {mode?.kill_switch ? "Disable Kill Switch" : "🛑 Enable Kill Switch"}
-                </button>
-              </div>
-            )}
-          </div>
-
-          <div className="card" style={{ marginTop: 12 }}>
-            <h3 style={{ marginTop: 0 }}>Open Live Positions</h3>
-            {!isLive && <div className="sub">Arm live mode to view positions.</div>}
-            {isLive && openTrades.length === 0 && <div className="sub">No open live positions.</div>}
-            {isLive && openTrades.length > 0 && (
+            <div className="card">
+              <h3>CLOSED TRADES (LIVE)</h3>
               <table>
-                <thead>
-                  <tr>
-                    <th>Market</th>
-                    <th>Dir</th>
-                    <th>Entry</th>
-                    <th>Now</th>
-                    <th>Size $</th>
-                    <th>Score</th>
-                    <th>Opened</th>
-                  </tr>
-                </thead>
+                <thead><tr><th>Time</th><th>Market</th><th>Invested</th><th>Got Back</th><th>P/L</th></tr></thead>
+                <tbody>
+                  {closedTrades.map((t) => (
+                    <tr key={t.id}>
+                      <td>{t.closed_at ? new Date(t.closed_at).toLocaleTimeString() : "--"}</td>
+                      <td>{t.market_title}</td>
+                      <td>${t.amount.toFixed(2)}</td>
+                      <td style={{ color: t.pnl >= 0 ? "#63ffbe" : "#ff8f9a", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
+                        {t.amount.toFixed(2)} {t.pnl >= 0 ? "+" : "-"} {Math.abs(t.pnl).toFixed(2)}
+                      </td>
+                      <td style={{ color: t.pnl >= 0 ? "#63ffbe" : "#ff8f9a" }}>{t.pnl >= 0 ? "+" : ""}{t.pnl.toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="card">
+              <h3>OPEN POSITIONS (LIVE)</h3>
+              <table>
+                <thead><tr><th>Market</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th></tr></thead>
                 <tbody>
                   {openTrades.map((t) => (
                     <tr key={t.id}>
-                      <td title={t.market_title}>{t.market_title.slice(0, 60)}</td>
-                      <td>{t.direction}</td>
-                      <td>{t.entry_price.toFixed(3)}</td>
-                      <td>{(t.current_price ?? 0).toFixed(3)}</td>
-                      <td>${t.amount.toFixed(2)}</td>
-                      <td>{t.agent_score}</td>
-                      <td>{new Date(t.opened_at).toLocaleTimeString()}</td>
+                      <td>{t.market_title}</td><td>{t.direction}</td><td>{t.amount.toFixed(2)}</td><td>{t.entry_price.toFixed(3)}</td><td>{(t.current_price ?? 0).toFixed(3)}</td><td>{t.pnl.toFixed(2)}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-            )}
-          </div>
-
-          <div className="card" style={{ marginTop: 12 }}>
-            <h3 style={{ marginTop: 0 }}>Recent Closed (live)</h3>
-            {!isLive && <div className="sub">Arm live mode to view closed trades.</div>}
-            {isLive && recentClosed.length === 0 && <div className="sub">No closed live trades yet.</div>}
-            {isLive && recentClosed.length > 0 && (
+            </div>
+            <div className="card">
+              <h3>FOCUS MARKETS</h3>
               <table>
-                <thead>
-                  <tr>
-                    <th>Market</th>
-                    <th>Dir</th>
-                    <th>Entry → Exit</th>
-                    <th>P&amp;L</th>
-                    <th>Status</th>
-                    <th>Closed</th>
-                  </tr>
-                </thead>
+                <thead><tr><th>Market</th><th>YES</th><th>NO</th></tr></thead>
+                <tbody>{markets.map((m) => <tr key={m.id}><td>{m.title}</td><td>{m.yes_price.toFixed(3)}</td><td>{m.no_price.toFixed(3)}</td></tr>)}</tbody>
+              </table>
+            </div>
+          </div>
+          <div className="operator-side">
+            <div className="card">
+              <h3>LIVE CONTROLS</h3>
+              <div className="operator-kv"><span>Mode</span><strong>{modeLabel}</strong></div>
+              <div className="operator-kv"><span>Live Enabled (config)</span><strong>{mode?.live_enabled ? "yes" : "no"}</strong></div>
+              <div className="operator-kv"><span>Kill Switch</span><strong>{mode?.kill_switch ? "ON" : "off"}</strong></div>
+              <div className="operator-kv"><span>Bot</span><strong>{bot?.status ?? "—"}</strong></div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8, marginTop: 10 }}>
+                <button className="btn btn-stop" disabled={busy} onClick={killToggle}>{mode?.kill_switch ? "Disable Kill" : "Enable Kill"}</button>
+              </div>
+            </div>
+            <div className="card">
+              <h3>LIVE VAULT</h3>
+              <div className="operator-kv"><span>Trade Balance</span><strong>${liveTradeBalance.toFixed(2)}</strong></div>
+              <div className="operator-kv"><span>Vault Balance</span><strong>${(wallet?.live_vault_balance ?? 0).toFixed(2)}</strong></div>
+              <div className="operator-kv"><span>Actual Balance</span><strong>${liveTotalBalance.toFixed(2)}</strong></div>
+              <div className="operator-kv"><span>Trade Cap</span><strong>${(wallet?.live_trade_cap_usd ?? 30).toFixed(2)}</strong></div>
+              <div className="operator-kv"><span>Sweeps</span><strong>{wallet?.live_vault_sweeps_count ?? 0}</strong></div>
+              <div className="operator-kv"><span>Last Sweep</span><strong>{wallet?.live_last_sweep_at ? new Date(wallet.live_last_sweep_at).toLocaleString() : "—"}</strong></div>
+              <div className="operator-kv"><span>Last Withdraw</span><strong>{wallet?.live_last_withdraw_at ? new Date(wallet.live_last_withdraw_at).toLocaleString() : "—"}</strong></div>
+              <div className="operator-kv"><span>Withdrawn Total</span><strong>${(wallet?.live_withdrawn_total ?? 0).toFixed(2)}</strong></div>
+              <div className="operator-kv"><span>Auto Withdraw</span><strong>{wallet?.live_auto_withdraw_enabled ? "ON" : "OFF"}</strong></div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8, marginTop: 10 }}>
+                <button className="btn btn-secondary" disabled={busy} onClick={setLiveVaultCap}>Set Cap</button>
+                <button className="btn btn-secondary" disabled={busy} onClick={manualWithdraw}>Manual Withdraw</button>
+                <button className="btn btn-secondary" disabled={busy} onClick={toggleAutoWithdraw}>{wallet?.live_auto_withdraw_enabled ? "Disable Auto Withdraw" : "Enable Auto Withdraw"}</button>
+                <button className="btn btn-stop" disabled={busy} onClick={unlockToTrade}>Emergency Unlock</button>
+              </div>
+            </div>
+            <div className="card">
+              <h3>WITHDRAW JOBS</h3>
+              <table>
+                <thead><tr><th>Time</th><th>Amount</th><th>Status</th><th>Tx</th><th>Attempts</th></tr></thead>
                 <tbody>
-                  {recentClosed.map((t) => (
-                    <tr key={t.id}>
-                      <td title={t.market_title}>{t.market_title.slice(0, 60)}</td>
-                      <td>{t.direction}</td>
-                      <td>
-                        {t.entry_price.toFixed(3)} → {(t.current_price ?? 0).toFixed(3)}
-                      </td>
-                      <td className={t.pnl >= 0 ? "pos" : "neg"}>
-                        {t.pnl >= 0 ? "+" : ""}
-                        {t.pnl.toFixed(4)}
-                      </td>
-                      <td>{t.status.replace("CLOSED_", "")}</td>
-                      <td>{t.closed_at ? new Date(t.closed_at).toLocaleString() : "—"}</td>
+                  {withdrawJobs.map((j) => (
+                    <tr key={j.id}>
+                      <td>{j.created_at ? new Date(j.created_at).toLocaleTimeString() : "--"}</td>
+                      <td>${j.amount_usd.toFixed(2)}</td>
+                      <td>{j.status}</td>
+                      <td>{j.tx_hash ? `${j.tx_hash.slice(0, 8)}…` : "—"}</td>
+                      <td>{j.attempts}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-            )}
+            </div>
           </div>
-        </div>
-
-        <div className="card dashx-side">
-          <h3 style={{ marginTop: 0 }}>Mode Telemetry</h3>
-          <div className="dashx-account-row">
-            <span>Mode</span>
-            <strong className={badge?.cls === "neg" ? "neg" : badge?.cls === "pending" ? "pending" : "pos"}>
-              {mode?.mode ?? "—"}
-            </strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Live enabled (config)</span>
-            <strong>{mode?.live_enabled ? "yes" : "no"}</strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Kill switch</span>
-            <strong className={mode?.kill_switch ? "neg" : "pos"}>
-              {mode?.kill_switch ? "ON" : "off"}
-            </strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Requested at</span>
-            <strong>{mode?.requested_at ? new Date(mode.requested_at).toLocaleString() : "—"}</strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Armed at</span>
-            <strong>{mode?.armed_at ? new Date(mode.armed_at).toLocaleString() : "—"}</strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Last changed</span>
-            <strong>{mode?.last_changed_at ? new Date(mode.last_changed_at).toLocaleString() : "—"}</strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Bot</span>
-            <strong>
-              {bot?.status ?? "—"} · {bot?.state ?? "—"}
-            </strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Trades today</span>
-            <strong>{bot?.trades_today ?? 0}</strong>
-          </div>
-          <div className="dashx-account-row">
-            <span>Scanned today</span>
-            <strong>{bot?.scanned_markets_today ?? 0}</strong>
-          </div>
-
-          <h3 style={{ marginTop: 16 }}>Active Limits</h3>
-          {mode?.limits && Object.keys(mode.limits).length > 0 ? (
-            Object.entries(mode.limits).map(([k, v]) => (
-              <div className="dashx-account-row" key={k}>
-                <span>{k}</span>
-                <strong>{String(v)}</strong>
-              </div>
-            ))
-          ) : (
-            <div className="sub">No overrides — using config defaults.</div>
-          )}
         </div>
       </div>
     </div>

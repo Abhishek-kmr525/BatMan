@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.core.db import SessionLocal
@@ -18,6 +19,8 @@ from app.services.polymarket import get_polymarket
 from app.services import poly_wallet
 from app.services.poly_analyzer import analyze_polymarket
 from app.services.poly_live import place_live_order
+from app.services.poly_live_vault import sweep_live_excess_if_needed
+from app.services.poly_live_vault import compute_auto_withdraw_eligibility, execute_withdraw_job, request_withdraw_job
 from app.services.risk_engine import check_polymarket_entry_risk
 
 State = Literal["IDLE", "SCANNING", "ANALYZING", "EXECUTING", "STOPPED"]
@@ -29,7 +32,10 @@ class PolymarketBot:
     # is transiently closed by _manage_positions before the next scan).
     _LIVE_ORDER_COOLDOWN_SECS = 1200  # 20 minutes
 
-    def __init__(self) -> None:
+    def __init__(self, *, bot_kind: Literal["paper", "live"] = "paper") -> None:
+        self.bot_kind: Literal["paper", "live"] = bot_kind
+        self.trade_mode: str = "live" if bot_kind == "live" else "paper"
+        self.is_live_bot: bool = bot_kind == "live"
         self.state: State = "STOPPED"
         self.started_at: datetime | None = None
         self.trades_today = 0
@@ -76,6 +82,7 @@ class PolymarketBot:
         if self.started_at and self.running:
             uptime = int((datetime.now(timezone.utc) - self.started_at).total_seconds())
         return {
+            "bot_kind": self.bot_kind,
             "status": "running" if self.running else "stopped",
             "state": self.state,
             "uptime_seconds": uptime,
@@ -87,12 +94,25 @@ class PolymarketBot:
         }
 
     async def _log(self, level: str, message: str, **meta) -> None:
-        async with SessionLocal() as s:
-            s.add(BotLog(level=level, message=message, metadata_json={"platform": "polymarket", **(meta or {})}))
-            await s.commit()
+        payload = {"platform": "polymarket", "bot_kind": self.bot_kind, **(meta or {})}
+        # Logging must never crash the trading loop.
+        for attempt in range(3):
+            try:
+                async with SessionLocal() as s:
+                    s.add(BotLog(level=level, message=message, metadata_json=payload))
+                    await s.commit()
+                break
+            except OperationalError as e:
+                err = str(e).lower()
+                if "database is locked" in err and attempt < 2:
+                    await asyncio.sleep(0.12 * (attempt + 1))
+                    continue
+                break
+            except Exception:
+                break
         await bus.publish(
             "agent:log",
-            {"level": level, "message": message, "metadata": {"platform": "polymarket", **meta}, "ts": datetime.now(timezone.utc).isoformat()},
+            {"level": level, "message": message, "metadata": payload, "ts": datetime.now(timezone.utc).isoformat()},
         )
 
     async def _loop(self) -> None:
@@ -110,6 +130,9 @@ class PolymarketBot:
                 pass
 
     async def _tick(self, poly) -> None:
+        if self.is_live_bot and not settings.POLYMARKET_LIVE_ENABLED:
+            await self._log("INFO", "polymarket live bot idle: POLYMARKET_LIVE_ENABLED=false")
+            return
         self.state = "SCANNING"
         markets = await poly.get_markets(limit=300)
         self.last_scan_count = len(markets)
@@ -139,20 +162,43 @@ class PolymarketBot:
 
         candidates.sort(key=lambda m: m.volume, reverse=True)
         self.state = "ANALYZING"
+        await self._log("INFO", f"polymarket tick: scanned={len(markets)} candidates={len(candidates)}")
         async with SessionLocal() as s:
             await self._manage_positions(s, poly)
             open_rows = (
-                await s.execute(select(PolyTrade).where(PolyTrade.status == "OPEN"))
+                await s.execute(
+                    select(PolyTrade).where(
+                        PolyTrade.status == "OPEN",
+                        PolyTrade.mode == self.trade_mode,
+                    )
+                )
             ).scalars().all()
             if len(open_rows) >= settings.POLYMARKET_MAX_OPEN_POSITIONS:
                 return
 
             open_market_ids = {t.market_id for t in open_rows}
             wallet = await poly_wallet.get_wallet(s)
+            # Vault-first guard (paper only): if a close/deposit pushed funds over
+            # cap, sweep immediately and skip any new opens this tick.
+            if not self.is_live_bot:
+                wallet, swept_now = await poly_wallet.enforce_vault_cap(s)
+                if swept_now > 0:
+                    await s.commit()
+                    await self._log(
+                        "INFO",
+                        f"VAULT_SWEEP paper +${swept_now:.2f} (trade->{wallet.trade_cap_usd:.2f}, "
+                        f"vault->{wallet.vault_balance:.2f})",
+                    )
+                    await self._log(
+                        "INFO",
+                        "polymarket vault guard: threshold reached; manage-only tick (no new opens)",
+                    )
+                    await bus.publish("polymarket:wallet:updated", {"balance": wallet.balance})
+                    return
 
             # Fetch live CLOB balance once per tick to guard against placing
             # orders that will fail due to insufficient on-chain funds.
-            _current_mode = mode_guard.get("polymarket").mode
+            _current_mode = "live_armed" if self.is_live_bot else "paper"
             _live_clob_balance: float | None = None
             if _current_mode == "live_armed":
                 from app.services.poly_live import get_live_balance
@@ -162,6 +208,19 @@ class PolymarketBot:
                         "INFO",
                         f"polymarket live CLOB balance: ${_live_clob_balance:.4f}",
                     )
+                    # Live vault sweep/partition on every fresh balance read.
+                    if settings.POLY_LIVE_VAULT_ENABLED:
+                        wallet, _ = await sweep_live_excess_if_needed(s, wallet, _live_clob_balance)
+                        await s.commit()
+                        # Auto-withdraw pipeline (single-flight in service).
+                        eligible, _reason, amount = await compute_auto_withdraw_eligibility(
+                            s, wallet, open_positions=len(open_rows)
+                        )
+                        if eligible and amount > 0:
+                            wjob = await request_withdraw_job(s, amount_usd=amount, requested_by="auto")
+                            await s.flush()
+                            await execute_withdraw_job(s, wjob, wallet)
+                            await s.commit()
 
             opened_this_tick = 0
             # In live mode cap new opens to 4 per tick to avoid flooding.
@@ -174,7 +233,14 @@ class PolymarketBot:
                 wallet.balance = round(_live_clob_balance, 4)
 
             for m in candidates[:25]:
+                title_short = " ".join((m.title or "").split())
+                title_short = f"{title_short[:88]}…" if len(title_short) > 88 else title_short
+                await self._log(
+                    "INFO",
+                    f"scan {m.id} | {title_short} | YES {m.yes_price:.3f} / NO {m.no_price:.3f}",
+                )
                 if m.id in open_market_ids:
+                    await self._log("INFO", f"skip {m.id}: already open")
                     continue
                 # Per-session cooldown: skip market ordered within last 20 min.
                 _last_ordered = self._recently_ordered.get(m.id)
@@ -188,52 +254,141 @@ class PolymarketBot:
                     break
 
                 # AI + candle + cheatsheet decision.
-                analysis = await analyze_polymarket(m)
+                try:
+                    analysis = await asyncio.wait_for(analyze_polymarket(m), timeout=12)
+                except asyncio.TimeoutError:
+                    await self._log("ERROR", f"polymarket analyze timeout {m.id}")
+                    continue
                 action = (analysis.action or "SKIP").upper()
+                await self._log("INFO", f"ai {m.id}: action={action} score={analysis.score}")
                 if action not in {"BUY_YES", "BUY_NO"}:
+                    await self._log("INFO", f"skip {m.id}: AI action {action}")
                     continue
                 if analysis.score < settings.POLYMARKET_MIN_SCORE:
+                    await self._log(
+                        "INFO",
+                        f"skip {m.id}: score {analysis.score} < min {settings.POLYMARKET_MIN_SCORE}",
+                    )
                     continue
 
                 side = "YES" if action == "BUY_YES" else "NO"
                 entry = m.yes_price if side == "YES" else m.no_price
 
-                # In paper mode / MODE-B (balance >= $5): skip weak favorites —
-                # coin-flip markets dominate full losses when following AI side.
-                # In MODE-A (balance < $5) we intentionally bet the underdog so
-                # the favourite-price filter does NOT apply (the cheap side will
-                # be re-selected below after the live-mode block is reached).
-                _is_live = mode_guard.get("polymarket").mode == "live_armed"
-                _live_bal_for_filter = _live_clob_balance if _is_live else None
-                _skip_fav_filter = _is_live and (
-                    _live_bal_for_filter is None or _live_bal_for_filter < 5.0
+                if not self.is_live_bot:
+                    await self._log("INFO", f"risk check {m.id}: begin")
+                    try:
+                        risk = await asyncio.wait_for(
+                            check_polymarket_entry_risk(
+                                s, m, score=analysis.score, open_positions=len(open_rows) + opened_this_tick
+                            ),
+                            timeout=5,
+                        )
+                    except asyncio.TimeoutError:
+                        await self._log("ERROR", f"polymarket risk timeout {m.id}")
+                        continue
+                    await self._log("INFO", f"risk check {m.id}: {risk.reason}")
+                    if not risk.allow:
+                        await self._log("INFO", f"polymarket risk blocked {m.id}: {risk.reason}", risk=risk.meta)
+                        continue
+
+                self.state = "EXECUTING"
+                # Independent paper/live bots share only kill-switch safety.
+                if mode_guard.get("polymarket").kill_switch:
+                    await self._log("INFO", "polymarket blocked open: kill switch ON")
+                    continue
+                mode = _current_mode
+                is_live_mode = self.is_live_bot
+                amount = settings.POLYMARKET_TRADE_AMOUNT_USD
+                # Use the same Mode-A/Mode-B strategy path in both live and paper.
+                # Live uses on-chain CLOB balance when known; paper uses wallet balance.
+                mode_balance = (
+                    wallet.live_trade_balance
+                    if (is_live_mode and settings.POLY_LIVE_VAULT_ENABLED)
+                    else (
+                        _live_clob_balance
+                        if (is_live_mode and _live_clob_balance is not None and _live_clob_balance > 0)
+                        else wallet.balance
+                    )
                 )
-                if not _skip_fav_filter and entry < settings.POLYMARKET_MIN_FAVORITE_PRICE:
+                mode_b = (mode_balance >= 5.0) and (not settings.POLYMARKET_FORCE_MODE_A)
+                CLOB_MIN_SIZE = 5.0
+
+                if mode_b:
+                    # MODE-B: use AI-recommended favourite with $5 size.
+                    if entry < settings.POLYMARKET_MIN_FAVORITE_PRICE:
+                        await self._log(
+                            "INFO",
+                            f"polymarket skip {m.id}: AI side {side}@{entry:.3f} "
+                            f"< min_favorite {settings.POLYMARKET_MIN_FAVORITE_PRICE:.2f}",
+                        )
+                        continue
+                    plan_amount = 5.00
+                    plan_side = side
+                    plan_entry = entry
+                    raw_size = plan_amount / max(plan_entry, 0.001)
+                    plan_size = max(raw_size, CLOB_MIN_SIZE)
+                    effective_amount = round(plan_size * plan_entry, 4)
                     await self._log(
                         "INFO",
-                        f"polymarket skip {m.id}: AI side {side}@{entry:.3f} "
-                        f"< min_favorite {settings.POLYMARKET_MIN_FAVORITE_PRICE:.2f}",
+                        f"polymarket MODE-B (≥$5): ${plan_amount:.2f} on "
+                        f"{plan_side}@{plan_entry:.3f} → {plan_size:.2f} contracts",
+                    )
+                else:
+                    # MODE-A: force cheap underdog side with $1 sizing.
+                    yes_p = getattr(m, "yes_price", None) or 0.5
+                    no_p = getattr(m, "no_price", None) or 0.5
+                    if yes_p <= no_p:
+                        plan_side = "YES"
+                        plan_entry = yes_p
+                    else:
+                        plan_side = "NO"
+                        plan_entry = no_p
+
+                    mode_a_max = float(getattr(settings, "POLYMARKET_MODE_A_MAX_UNDERDOG_PRICE", 0.20))
+                    if plan_entry > mode_a_max:
+                        await self._log(
+                            "INFO",
+                            f"polymarket MODE-A skip {m.id}: cheap side "
+                            f"{plan_side}@{plan_entry:.3f} > ${mode_a_max:.2f} — "
+                            f"need underdog ≤ ${mode_a_max:.2f}",
+                        )
+                        continue
+
+                    raw_size = 1.00 / max(plan_entry, 0.001)
+                    if raw_size < CLOB_MIN_SIZE:
+                        await self._log(
+                            "INFO",
+                            f"polymarket MODE-A skip {m.id}: $1 → {raw_size:.2f} contracts "
+                            f"< CLOB min 5 at {plan_entry:.3f}",
+                        )
+                        continue
+
+                    plan_size = round(raw_size, 2)
+                    effective_amount = round(plan_size * plan_entry, 4)
+                    await self._log(
+                        "INFO",
+                        f"polymarket MODE-A (<$5): $1.00 on "
+                        f"{plan_side}@{plan_entry:.3f} (underdog, {plan_size:.2f} contracts)",
+                    )
+
+                side = plan_side
+                entry = plan_entry
+                amount = effective_amount
+
+                if is_live_mode:
+                    if _live_clob_balance is None:
+                        await self._log("INFO", f"polymarket live skip {m.id}: live balance unavailable")
+                        continue
+                    spendable_balance = float(_live_clob_balance)
+                else:
+                    spendable_balance = float(wallet.balance)
+                if spendable_balance < effective_amount:
+                    await self._log(
+                        "INFO",
+                        f"polymarket skip {m.id}: wallet ${spendable_balance:.2f} < ${effective_amount:.2f}",
                     )
                     continue
 
-                risk = await check_polymarket_entry_risk(
-                    s, m, score=analysis.score, open_positions=len(open_rows) + opened_this_tick
-                )
-                if not risk.allow:
-                    await self._log("INFO", f"polymarket risk blocked {m.id}: {risk.reason}", risk=risk.meta)
-                    continue
-                amount = settings.POLYMARKET_TRADE_AMOUNT_USD
-                # Paper-mode wallet guard (live mode checks effective_amount after
-                # MODE-A/B sizing is computed further below).
-                if not _is_live and wallet.balance < amount:
-                    break
-
-                self.state = "EXECUTING"
-                can_open, reason = mode_guard.can_open_new_trade("polymarket")
-                if not can_open:
-                    await self._log("INFO", f"polymarket mode guard blocked open: {reason}")
-                    continue
-                mode = mode_guard.get("polymarket").mode
                 canary_ok, canary_reason, canary_meta = await check_polymarket_canary(
                     s, mode=mode, order_usd=amount
                 )
@@ -241,7 +396,7 @@ class PolymarketBot:
                     await self._log("INFO", f"polymarket canary blocked open: {canary_reason}", canary=canary_meta)
                     continue
 
-                if mode == "live_armed":
+                if is_live_mode:
                     raw_tokens = m.raw.get("clobTokenIds")
                     if isinstance(raw_tokens, str):
                         import json
@@ -254,64 +409,8 @@ class PolymarketBot:
                         await self._log("ERROR", f"polymarket live order blocked: missing clobTokenIds for {m.id}")
                         continue
 
-                    CLOB_MIN_SIZE = 5.0
                     balance_known = _live_clob_balance is not None and _live_clob_balance > 0.10
-
-                    if balance_known and _live_clob_balance >= 5.0:
-                        # ── MODE B: balance ≥ $5 → $5 on AI-recommended favourite ────────
-                        LIVE_AMOUNT = 5.00
-                        live_side = side
-                        live_entry = entry
-                        raw_size = LIVE_AMOUNT / max(live_entry, 0.001)
-                        live_size = max(raw_size, CLOB_MIN_SIZE)
-                        effective_amount = round(live_size * live_entry, 4)
-                        await self._log(
-                            "INFO",
-                            f"polymarket MODE-B (≥$5): ${LIVE_AMOUNT:.2f} on "
-                            f"{live_side}@{live_entry:.3f} → {live_size:.2f} contracts",
-                        )
-                    else:
-                        # ── MODE A: balance < $5 → $1 on the cheap (underdog) side ───────
-                        # Pick whichever side is cheaper (lower price = underdog).
-                        yes_p = getattr(m, "yes_price", None) or 0.5
-                        no_p  = getattr(m, "no_price",  None) or 0.5
-                        if yes_p <= no_p:
-                            live_side  = "YES"
-                            live_entry = yes_p
-                        else:
-                            live_side  = "NO"
-                            live_entry = no_p
-
-                        # Only viable if cheap side ≤ $0.20 (gives ≥5 contracts for $1).
-                        if live_entry > 0.20:
-                            await self._log(
-                                "INFO",
-                                f"polymarket MODE-A skip {m.id}: cheap side "
-                                f"{live_side}@{live_entry:.3f} > $0.20 — need underdog ≤ $0.20",
-                            )
-                            continue
-
-                        raw_size = 1.00 / max(live_entry, 0.001)
-                        if raw_size < CLOB_MIN_SIZE:
-                            await self._log(
-                                "INFO",
-                                f"polymarket MODE-A skip {m.id}: $1 → {raw_size:.2f} contracts "
-                                f"< CLOB min 5 at {live_entry:.3f}",
-                            )
-                            continue
-
-                        live_size = round(raw_size, 2)
-                        effective_amount = round(live_size * live_entry, 4)
-                        # Override AI side/entry so PolyTrade records the actual bet.
-                        side  = live_side
-                        entry = live_entry
-                        await self._log(
-                            "INFO",
-                            f"polymarket MODE-A (<$5): $1.00 on "
-                            f"{live_side}@{live_entry:.3f} (underdog, {live_size:.2f} contracts)",
-                        )
-
-                    token_id = raw_tokens[0] if live_side == "YES" else raw_tokens[1]
+                    token_id = raw_tokens[0] if side == "YES" else raw_tokens[1]
 
                     # Guard: CLOB on-chain balance must cover the order.
                     # No cushion — the returned free balance is already net of
@@ -324,21 +423,19 @@ class PolymarketBot:
                         )
                         continue
 
-                    # Guard: paper wallet balance.
-                    if wallet.balance < effective_amount:
-                        await self._log(
-                            "INFO",
-                            f"polymarket live skip {m.id}: wallet "
-                            f"${wallet.balance:.2f} < ${effective_amount:.2f}",
+                    try:
+                        live_res = await asyncio.wait_for(
+                            place_live_order(
+                                token_id=str(token_id),
+                                price=entry,
+                                size=plan_size,
+                                side="BUY",
+                            ),
+                            timeout=15,
                         )
+                    except asyncio.TimeoutError:
+                        await self._log("ERROR", f"polymarket live order timeout {m.id}")
                         continue
-
-                    live_res = await place_live_order(
-                        token_id=str(token_id),
-                        price=live_entry,
-                        size=live_size,
-                        side="BUY",
-                    )
                     if not live_res.get("ok"):
                         await self._log("ERROR", f"polymarket live order failed: {live_res.get('error')}")
                         continue
@@ -346,9 +443,9 @@ class PolymarketBot:
                     await self._log("INFO", f"polymarket live order placed {m.id}: {live_res.get('orderID')}")
                     # Record cooldown so we never re-order this market this session.
                     self._recently_ordered[m.id] = time.time()
-                    amount = effective_amount
 
-                await poly_wallet.debit(s, amount)
+                if not is_live_mode:
+                    await poly_wallet.debit(s, amount)
                 reasoning_blob = (
                     f"asset={analysis.asset} interval={analysis.interval} "
                     f"conf={analysis.confidence:.2f} {analysis.reasoning}"
@@ -363,7 +460,7 @@ class PolymarketBot:
                     status="OPEN",
                     agent_score=analysis.score,
                     reasoning=reasoning_blob[:280],
-                    mode="live" if mode == "live_armed" else "paper",
+                    mode=self.trade_mode,
                 )
                 s.add(t)
                 await s.commit()
@@ -383,7 +480,8 @@ class PolymarketBot:
                         "interval": analysis.interval,
                     },
                 )
-                await bus.publish("polymarket:wallet:updated", {"balance": wallet.balance})
+                if not is_live_mode:
+                    await bus.publish("polymarket:wallet:updated", {"balance": wallet.balance})
                 await self._log(
                     "INFO",
                     f"polymarket opened {side} {m.id} @ {entry} ({analysis.asset}/{analysis.interval}, score={analysis.score})",
@@ -405,7 +503,14 @@ class PolymarketBot:
         return any(tok in hay for tok in ("5m", "15m", "5 min", "15 min"))
 
     async def _manage_positions(self, s, poly) -> None:
-        open_rows = (await s.execute(select(PolyTrade).where(PolyTrade.status == "OPEN"))).scalars().all()
+        open_rows = (
+            await s.execute(
+                select(PolyTrade).where(
+                    PolyTrade.status == "OPEN",
+                    PolyTrade.mode == self.trade_mode,
+                )
+            )
+        ).scalars().all()
         if not open_rows:
             return
             
@@ -445,8 +550,7 @@ class PolymarketBot:
                                 t.pnl = pnl
                                 t.closed_at = datetime.now(timezone.utc)
 
-                                mode = mode_guard.get("polymarket").mode
-                                if mode == "live_armed":
+                                if self.is_live_bot:
                                     raw_tokens = data.get("clobTokenIds")
                                     if isinstance(raw_tokens, str):
                                         import json
@@ -462,9 +566,18 @@ class PolymarketBot:
                                         )
                                         if not live_res.get("ok"):
                                             await self._log("ERROR", f"polymarket live sl exit failed: {live_res.get('error')}")
+                                            # Do not mark closed without a confirmed live exit.
+                                            continue
 
-                                await poly_wallet.credit(s, payout)
-                                await poly_wallet.record_close(s, pnl, False)
+                                if not self.is_live_bot:
+                                    _, swept = await poly_wallet.credit(s, payout)
+                                    await poly_wallet.record_close(s, pnl, False)
+                                    if swept > 0:
+                                        w_after = await poly_wallet.get_wallet(s)
+                                        await self._log(
+                                            "INFO",
+                                            f"VAULT_SWEEP paper +${swept:.2f} (trade->{w_after.trade_cap_usd:.2f}, vault->{w_after.vault_balance:.2f})",
+                                        )
                                 await s.commit()
                                 await self._log(
                                     "INFO",
@@ -472,8 +585,9 @@ class PolymarketBot:
                                     f"exit={cur:.3f} pnl={pnl:.3f}",
                                 )
                                 await bus.publish("polymarket:trade:closed", {"id": t.id, "pnl": pnl})
-                                w = await poly_wallet.get_wallet(s)
-                                await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
+                                if not self.is_live_bot:
+                                    w = await poly_wallet.get_wallet(s)
+                                    await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
                                 continue
 
                             # ── Take Profit: position value gained +15% ─────────
@@ -486,8 +600,7 @@ class PolymarketBot:
                                 t.pnl = pnl
                                 t.closed_at = datetime.now(timezone.utc)
                                 
-                                mode = mode_guard.get("polymarket").mode
-                                if mode == "live_armed":
+                                if self.is_live_bot:
                                     raw_tokens = data.get("clobTokenIds")
                                     if isinstance(raw_tokens, str):
                                         import json
@@ -501,17 +614,27 @@ class PolymarketBot:
                                         live_res = await place_live_order(token_id=str(token_id), price=cur, size=size, side="SELL")
                                         if not live_res.get("ok"):
                                             await self._log("ERROR", f"polymarket live tp exit failed: {live_res.get('error')}")
+                                            # Do not mark closed without a confirmed live exit.
+                                            continue
 
-                                await poly_wallet.credit(s, payout)
-                                await poly_wallet.record_close(s, pnl, pnl > 0)
+                                if not self.is_live_bot:
+                                    _, swept = await poly_wallet.credit(s, payout)
+                                    await poly_wallet.record_close(s, pnl, pnl > 0)
+                                    if swept > 0:
+                                        w_after = await poly_wallet.get_wallet(s)
+                                        await self._log(
+                                            "INFO",
+                                            f"VAULT_SWEEP paper +${swept:.2f} (trade->{w_after.trade_cap_usd:.2f}, vault->{w_after.vault_balance:.2f})",
+                                        )
                                 await s.commit()
                                 await self._log(
                                     "INFO",
                                     f"polymarket TP+15% closed {t.id} entry={t.entry_price:.3f} exit={cur:.3f} pnl={pnl:.3f}",
                                 )
                                 await bus.publish("polymarket:trade:closed", {"id": t.id, "pnl": pnl})
-                                w = await poly_wallet.get_wallet(s)
-                                await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
+                                if not self.is_live_bot:
+                                    w = await poly_wallet.get_wallet(s)
+                                    await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
                                 continue
 
                 if closed or not active:
@@ -546,17 +669,28 @@ class PolymarketBot:
                             t.pnl = round(pnl, 4)
                             t.closed_at = datetime.now(timezone.utc)
                             
-                            await poly_wallet.credit(s, t.amount + t.pnl)
-                            await poly_wallet.record_close(s, t.pnl, win)
+                            if not self.is_live_bot:
+                                _, swept = await poly_wallet.credit(s, t.amount + t.pnl)
+                                await poly_wallet.record_close(s, t.pnl, win)
+                                if swept > 0:
+                                    w_after = await poly_wallet.get_wallet(s)
+                                    await self._log(
+                                        "INFO",
+                                        f"VAULT_SWEEP paper +${swept:.2f} (trade->{w_after.trade_cap_usd:.2f}, vault->{w_after.vault_balance:.2f})",
+                                    )
                             await s.commit()
                             
                             await self._log("INFO", f"polymarket closed {t.id} {status} pnl={t.pnl:.2f}")
                             await bus.publish("polymarket:trade:closed", {"id": t.id, "pnl": t.pnl})
-                            w = await poly_wallet.get_wallet(s)
-                            await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
+                            if not self.is_live_bot:
+                                w = await poly_wallet.get_wallet(s)
+                                await bus.publish("polymarket:wallet:updated", {"balance": w.balance})
             except Exception as e:
                 await self._log("ERROR", f"polymarket manage position {t.id} failed: {e}")
 
 
 
-poly_bot = PolymarketBot()
+poly_paper_bot = PolymarketBot(bot_kind="paper")
+poly_live_bot = PolymarketBot(bot_kind="live")
+# Backward-compat alias (paper).
+poly_bot = poly_paper_bot

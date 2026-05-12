@@ -22,6 +22,59 @@ logger = logging.getLogger(__name__)
 _client: ClobClient | None = None
 _proxy_installed: bool = False
 
+def _hydrate_api_creds(client: ClobClient) -> bool:
+    """Ensure client has L2 creds; retry-safe for long-lived singleton client."""
+    try:
+        # Already hydrated.
+        if getattr(client, "creds", None):
+            return True
+    except Exception:
+        pass
+
+    import os
+    api_key = (
+        getattr(settings, "POLYMARKET_API_KEY", None)
+        or os.getenv("POLYMARKET_API_KEY", "")
+    ) or ""
+    api_secret = (
+        getattr(settings, "POLYMARKET_API_SECRET", None)
+        or os.getenv("POLYMARKET_API_SECRET", "")
+    ) or ""
+    api_passphrase = (
+        getattr(settings, "POLYMARKET_API_PASSPHRASE", None)
+        or os.getenv("POLYMARKET_API_PASSPHRASE", "")
+    ) or ""
+
+    # Prefer explicit env creds when present.
+    if api_key and api_secret and api_passphrase:
+        try:
+            client.set_api_creds(
+                ApiCreds(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    api_passphrase=api_passphrase,
+                )
+            )
+            logger.info("Hydrated CLOB API creds from env")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to set API creds from env: {e}")
+
+    # Otherwise derive from signer.
+    for method in ("create_or_derive_api_key", "create_api_key", "derive_api_key"):
+        fn = getattr(client, method, None)
+        if fn is None:
+            continue
+        try:
+            creds = fn()
+            if creds is not None:
+                client.set_api_creds(creds)
+                logger.info(f"Hydrated CLOB API creds via {method}")
+                return True
+        except Exception as e:
+            logger.warning(f"{method} failed: {e}")
+    return False
+
 
 def _install_proxy_if_configured() -> None:
     """Route only Polymarket CLOB traffic through a configured outbound proxy.
@@ -64,8 +117,7 @@ def get_live_client() -> ClobClient | None:
         try:
             import os
             # Always use explicit env config — the fallback sweeper discovers the
-            # working (sig_type, funder) and we lock it in via env vars so it
-            # survives redeploys without needing another sweep.
+            # working (sig_type, funder) and we lock it in via env vars.
             sig_type = int(getattr(settings, "POLYMARKET_SIGNATURE_TYPE", 0))
             explicit_funder = (
                 getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
@@ -88,36 +140,9 @@ def get_live_client() -> ClobClient | None:
                 f"(signature_type={sig_type}, funder={funder_addr})"
             )
 
-            # Prefer pre-existing API creds from env (required for proxy/Magic
-            # wallet accounts where create_api_key fails without a browser session).
-            api_key = (
-                getattr(settings, "POLYMARKET_API_KEY", None)
-                or os.getenv("POLYMARKET_API_KEY", "")
-            ) or ""
-            api_secret = (
-                getattr(settings, "POLYMARKET_API_SECRET", None)
-                or os.getenv("POLYMARKET_API_SECRET", "")
-            ) or ""
-            api_passphrase = (
-                getattr(settings, "POLYMARKET_API_PASSPHRASE", None)
-                or os.getenv("POLYMARKET_API_PASSPHRASE", "")
-            ) or ""
-
-            if api_key and api_secret and api_passphrase:
-                creds = ApiCreds(
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    api_passphrase=api_passphrase,
-                )
-                logger.info("Using pre-existing API creds from env (POLYMARKET_API_KEY/SECRET/PASSPHRASE)")
-            else:
-                # Derive creds from private key (works for EOA sig_type=0 accounts).
-                try:
-                    creds = _client.create_api_key()
-                except Exception:
-                    creds = _client.derive_api_key()
-                logger.info("Derived API creds from private key")
-            _client.set_api_creds(creds)
+            # Best-effort initial hydration; get_live_balance/place_live_order
+            # will retry hydration on demand if this step fails.
+            _hydrate_api_creds(_client)
         except Exception as e:
             logger.error(f"Failed to init Polymarket ClobClient: {e}")
             return None
@@ -134,6 +159,8 @@ async def get_live_balance() -> float:
     if not client:
         _last_balance_error = "ClobClient not initialised — check POLYMARKET_PRIVATE_KEY"
         return 0.0
+    # Heal clients that were initialized without creds after transient auth error.
+    _hydrate_api_creds(client)
     try:
         res = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
         # Balance returned as raw USDC atomic units (6 decimals); divide by 1e6.
@@ -141,10 +168,24 @@ async def get_live_balance() -> float:
         return raw_bal / 1e6
     except Exception as e:
         err_msg = str(getattr(e, "error_msg", getattr(e, "error_message", str(e))))
+        # Retry once if SDK says L2 creds are missing/invalid.
+        if "API Credentials are needed" in err_msg:
+            if _hydrate_api_creds(client):
+                try:
+                    res = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                    raw_bal = float(res.get("balance", 0))
+                    return raw_bal / 1e6
+                except Exception as e2:
+                    err_msg = str(getattr(e2, "error_msg", getattr(e2, "error_message", str(e2))))
         if hasattr(e, "status_code"):
             err_msg = f"HTTP {e.status_code}: {err_msg}"
         _last_balance_error = err_msg
-        logger.error(f"Failed to fetch live polymarket balance: {err_msg}")
+        logger.error(
+            "Failed to fetch live polymarket balance: %s | host=%s proxy=%s",
+            err_msg,
+            getattr(settings, "POLYMARKET_HOST", ""),
+            "set" if bool(getattr(settings, "POLYMARKET_PROXY_URL", "")) else "empty",
+        )
         return 0.0
 
 
@@ -162,6 +203,7 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
     client = get_live_client()
     if not client:
         return {"ok": False, "error": "live client not initialized"}
+    _hydrate_api_creds(client)
     try:
         # Polymarket Up/Down crypto markets are negRisk. The CLOB order
         # typehash differs between standard and negRisk markets — the wrong
@@ -235,6 +277,17 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
                 return _fallback_order_placement(client, order_args, neg_risk)
 
         return {"ok": False, "error": err_msg}
+
+
+async def perform_live_withdraw(amount_usd: float, idempotency_key: str) -> tuple[bool, str | None, str | None]:
+    """Best-effort live withdraw adapter.
+
+    v1 ships with a safe placeholder: no transfer call is executed yet because
+    CLOB SDK does not expose a direct collateral-withdraw endpoint in this app
+    flow. Returns a clear message so the job pipeline and UI can be validated.
+    """
+    _ = (amount_usd, idempotency_key)
+    return False, None, "withdraw adapter not configured"
 
 def _fallback_order_placement(original_client, order_args, neg_risk):
     global _client  # declare once at top so inner assignments don't trigger SyntaxError

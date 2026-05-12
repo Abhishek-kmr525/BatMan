@@ -1,15 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, API } from "../../lib/api";
-
-type ModeGuard = {
-  mode: "paper" | "live";
-  pending_live: boolean;
-  kill_switch: boolean;
-  live_enabled: boolean;
-  limits?: Record<string, any>;
-};
+import { api } from "../../lib/api";
 
 type BotSnapshot = {
   platform: string;
@@ -30,56 +22,57 @@ type BotSnapshot = {
     wins: number;
     losses: number;
   };
-  mode_guard: ModeGuard;
+  mode_guard: {
+    platform: string;
+    mode: string;
+    live_enabled: boolean;
+    kill_switch: boolean;
+    requested_at?: string | null;
+    armed_at?: string | null;
+  };
 };
 
 type BotsAggregate = {
   kalshi: BotSnapshot;
-  polymarket: BotSnapshot;
-  combined: {
-    today_pnl: number;
-    today_opened: number;
-    active_positions: number;
-    balance: number;
-  };
 };
 
-type DailyRow = { date: string; pnl: number; trades: number; wins: number; losses: number };
-type DailyReport = {
-  from: string;
-  to: string;
-  days: number;
-  series: { kalshi?: DailyRow[]; polymarket?: DailyRow[] };
-  combined: DailyRow[];
+type Trade = {
+  id: string;
+  market_title: string;
+  direction: "YES" | "NO";
+  entry_price: number;
+  current_price?: number | null;
+  amount: number;
+  pnl: number;
+  status: string;
 };
 
-const startPaths: Record<string, string> = {
-  kalshi: "/bot/start",
-  polymarket: "/polymarket/bot/start",
-};
-const stopPaths: Record<string, string> = {
-  kalshi: "/bot/stop",
-  polymarket: "/polymarket/bot/stop",
-};
+type LogEntry = { id?: string; level: string; message: string; ts?: string; created_at?: string };
 
-export default function BotsPage() {
-  const [data, setData] = useState<BotsAggregate | null>(null);
-  const [report, setReport] = useState<DailyReport | null>(null);
+function modeBadge(mode: string) {
+  if (mode === "live_armed" || mode === "live") return "LIVE ARMED";
+  if (mode === "live_requested") return "LIVE REQUESTED";
+  return "PAPER";
+}
+
+export default function KalshiLivePage() {
+  const [k, setK] = useState<BotSnapshot | null>(null);
+  const [openTrades, setOpenTrades] = useState<Trade[]>([]);
+  const [closedTrades, setClosedTrades] = useState<Trade[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   async function refresh() {
-    try {
-      const [agg, rep] = await Promise.all([
-        api<BotsAggregate>("/bots"),
-        api<DailyReport>("/reports/daily?days=14"),
-      ]);
-      setData(agg);
-      setReport(rep);
-      setError(null);
-    } catch (e: any) {
-      setError(e?.message || "refresh failed");
-    }
+    const [agg, o, c, l] = await Promise.all([
+      api<BotsAggregate>("/bots"),
+      api<Trade[]>("/trades?status=open&limit=20&page=1"),
+      api<Trade[]>("/trades?status=closed&limit=20&page=1"),
+      api<LogEntry[]>("/agent/logs?limit=80"),
+    ]);
+    setK(agg.kalshi);
+    setOpenTrades(o);
+    setClosedTrades(c);
+    setLogs(l);
   }
 
   useEffect(() => {
@@ -88,223 +81,168 @@ export default function BotsPage() {
     return () => clearInterval(id);
   }, []);
 
-  async function start(platform: string) {
+  async function start() {
     setBusy(true);
     try {
-      await api(startPaths[platform], { method: "POST" });
+      await api("/bot/start", { method: "POST" });
       await refresh();
     } finally {
       setBusy(false);
     }
   }
-
-  async function stop(platform: string) {
+  async function stop() {
     setBusy(true);
     try {
-      await api(stopPaths[platform], { method: "POST" });
+      await api("/bot/stop", { method: "POST" });
       await refresh();
     } finally {
       setBusy(false);
     }
   }
-
-  async function requestLive(platform: string) {
-    setBusy(true);
-    try {
-      await api("/mode/request-live", {
-        method: "POST",
-        body: JSON.stringify({ platform }),
-      });
-      await refresh();
-    } catch (e: any) {
-      alert(e?.message || "request failed");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function confirmLive(platform: string) {
-    const pass = prompt(`Confirm LIVE mode for ${platform} — passcode`, "");
-    if (!pass) return;
-    setBusy(true);
-    try {
-      await api("/mode/confirm-live", {
-        method: "POST",
-        body: JSON.stringify({ platform, passcode: pass }),
-      });
-      await refresh();
-    } catch (e: any) {
-      alert(e?.message || "confirm failed");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function setPaper(platform: string) {
-    setBusy(true);
-    try {
-      await api("/mode/set-paper", {
-        method: "POST",
-        body: JSON.stringify({ platform }),
-      });
-      await refresh();
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function toggleKill(platform: string, current: boolean) {
+  async function killToggle() {
+    if (!k) return;
     setBusy(true);
     try {
       await api("/mode/kill-switch", {
         method: "POST",
-        body: JSON.stringify({ platform, enabled: !current }),
+        body: JSON.stringify({ platform: "kalshi", enabled: !k.mode_guard.kill_switch }),
       });
       await refresh();
     } finally {
       setBusy(false);
     }
   }
+  async function armOrPaper() {
+    if (!k) return;
+    setBusy(true);
+    try {
+      if (k.mode_guard.mode === "live_armed") {
+        await api("/mode/set-paper", { method: "POST", body: JSON.stringify({ platform: "kalshi" }) });
+      } else if (k.mode_guard.mode === "live_requested") {
+        const pass = prompt("Enter live mode passcode:");
+        if (!pass) return;
+        await api("/mode/confirm-live", {
+          method: "POST",
+          body: JSON.stringify({ platform: "kalshi", passcode: pass }),
+        });
+      } else {
+        await api("/mode/request-live", { method: "POST", body: JSON.stringify({ platform: "kalshi" }) });
+      }
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const live = k?.mode_guard.mode === "live_armed" || k?.mode_guard.mode === "live";
+  const running = k?.status === "running";
 
   return (
-    <div className="container">
-      <h1>Bots Control Center</h1>
-      <p className="sub">Live view of both bots, mode arming, kill switch, and 14-day PnL.</p>
-      {error && <p className="sub" style={{ color: "#ff7b7b" }}>Refresh issue: {error}</p>}
-
-      {data && (
-        <div className="card" style={{ marginBottom: 12 }}>
-          <div className="row">
-            <span>Combined balance</span>
-            <strong>${data.combined.balance.toFixed(2)}</strong>
-          </div>
-          <div className="row">
-            <span>Today PnL</span>
-            <strong style={{ color: data.combined.today_pnl >= 0 ? "#4ade80" : "#ff7b7b" }}>
-              ${data.combined.today_pnl.toFixed(4)}
-            </strong>
-          </div>
-          <div className="row">
-            <span>Today opened</span>
-            <strong>{data.combined.today_opened}</strong>
-          </div>
-          <div className="row">
-            <span>Active positions</span>
-            <strong>{data.combined.active_positions}</strong>
-          </div>
+    <div className="container" style={{ maxWidth: "100%", padding: 16 }}>
+      <div className="operator-header">
+        <div className="operator-left">
+          <div className="operator-title">AMTA COMMAND</div>
+          <div className="operator-pill">Kalshi Bot Console [K2]</div>
+          <div className="operator-pill">{modeBadge(k?.mode_guard.mode || "paper")}</div>
+          <div className="operator-pill">HEALTHY</div>
         </div>
-      )}
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(360px, 1fr))", gap: 12 }}>
-        {data && (["kalshi", "polymarket"] as const).map((p) => {
-          const b = data[p];
-          const live = b.mode_guard.mode === "live";
-          return (
-            <div key={p} className="card">
-              <h2 style={{ textTransform: "capitalize", marginTop: 0 }}>
-                {p}
-                <span style={{
-                  marginLeft: 8,
-                  fontSize: 12,
-                  padding: "2px 8px",
-                  borderRadius: 6,
-                  background: live ? "#7f1d1d" : "#1f2937",
-                  color: live ? "#fecaca" : "#9ca3af",
-                }}>
-                  {live ? "LIVE (ARMED)" : "PAPER"}
-                </span>
-                {b.mode_guard.kill_switch && (
-                  <span style={{ marginLeft: 6, fontSize: 12, color: "#ff7b7b" }}>KILL</span>
-                )}
-              </h2>
-              <div className="row"><span>Status</span><strong>{b.status} · {b.state}</strong></div>
-              <div className="row"><span>Wallet</span><strong>${b.wallet.balance.toFixed(2)}</strong></div>
-              <div className="row"><span>Today PnL</span>
-                <strong style={{ color: b.today_pnl >= 0 ? "#4ade80" : "#ff7b7b" }}>
-                  ${b.today_pnl.toFixed(4)}
-                </strong>
-              </div>
-              <div className="row"><span>Today opened</span><strong>{b.today_opened}</strong></div>
-              <div className="row"><span>Open positions</span>
-                <strong>{b.active_positions} / {b.max_concurrent_positions}</strong>
-              </div>
-              <div className="row"><span>Last scan</span>
-                <strong>{b.last_candidate_count}/{b.last_scan_count}</strong>
-              </div>
-              <div className="row"><span>Scanned today</span><strong>{b.scanned_today}</strong></div>
-              <div className="row"><span>Total trades</span>
-                <strong>{b.wallet.total_trades} ({b.wallet.wins}W/{b.wallet.losses}L)</strong>
-              </div>
-
-              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-                <button className="btn btn-start" disabled={busy} onClick={() => start(p)}>Start</button>
-                <button className="btn btn-stop" disabled={busy} onClick={() => stop(p)}>Stop</button>
-                {!live ? (
-                  <>
-                    <button className="btn btn-secondary" disabled={busy || !b.mode_guard.live_enabled}
-                      onClick={() => (b.mode_guard.pending_live ? confirmLive(p) : requestLive(p))}>
-                      {b.mode_guard.pending_live ? "Confirm LIVE" : "Request LIVE"}
-                    </button>
-                  </>
-                ) : (
-                  <button className="btn btn-secondary" disabled={busy} onClick={() => setPaper(p)}>Back to Paper</button>
-                )}
-                <button className="btn btn-secondary" disabled={busy} onClick={() => toggleKill(p, b.mode_guard.kill_switch)}>
-                  {b.mode_guard.kill_switch ? "Release Kill" : "Kill Switch"}
-                </button>
-              </div>
-              {!b.mode_guard.live_enabled && (
-                <p className="sub" style={{ marginTop: 8 }}>
-                  Live disabled in env (set {p.toUpperCase()}_LIVE_ENABLED=true to allow arming).
-                </p>
-              )}
-            </div>
-          );
-        })}
+        <div className="operator-right">
+          <button className="btn btn-secondary" onClick={() => refresh()} disabled={busy}>REFRESH</button>
+          <button className="btn btn-start" onClick={start} disabled={busy}>START ENGINE</button>
+          <button className="btn btn-stop" onClick={killToggle} disabled={busy}>KILL ALL</button>
+        </div>
       </div>
 
-      <h2 style={{ marginTop: 24 }}>14-day PnL</h2>
-      <div className="card">
-        <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
-          <a className="btn btn-secondary" href={`${API}/api/reports/export.csv?platform=all&status=all`}>
-            Export all CSV
-          </a>
-          <a className="btn btn-secondary" href={`${API}/api/reports/export.csv?platform=kalshi&status=all`}>
-            Export Kalshi
-          </a>
-          <a className="btn btn-secondary" href={`${API}/api/reports/export.csv?platform=polymarket&status=all`}>
-            Export Polymarket
-          </a>
+      <section className="operator-kpis">
+        <div className="operator-kpi"><span>WALLET BALANCE</span><strong>${(k?.wallet.balance ?? 0).toFixed(2)}</strong></div>
+        <div className="operator-kpi"><span>TODAY PNL</span><strong className={(k?.today_pnl ?? 0) >= 0 ? "pos" : "neg"}>{(k?.today_pnl ?? 0).toFixed(2)}</strong></div>
+        <div className="operator-kpi"><span>7D PNL</span><strong>{(k?.wallet.total_pnl ?? 0).toFixed(2)}</strong></div>
+        <div className="operator-kpi"><span>OPEN POSITIONS</span><strong>{k?.active_positions ?? 0}</strong></div>
+        <div className="operator-kpi"><span>TRADES TODAY</span><strong>{k?.today_opened ?? 0}</strong></div>
+        <div className="operator-kpi"><span>WIN RATE</span><strong>{k ? ((k.wallet.wins / Math.max(1, k.wallet.total_trades)) * 100).toFixed(1) : "0.0"}%</strong></div>
+        <div className="operator-kpi"><span>SCAN RATE</span><strong>{k?.last_scan_count ?? 0}</strong></div>
+        <div className="operator-kpi"><span>ERRORS</span><strong>0</strong></div>
+      </section>
+
+      <div className="operator-main-grid">
+        <div className="operator-card">
+          <h3>Live Position Monitor</h3>
+          <div className="operator-table-wrap">
+            <table>
+              <thead>
+                <tr><th>Market</th><th>Side</th><th>Entry</th><th>Current</th><th>Size</th><th>PnL</th><th>Status</th></tr>
+              </thead>
+              <tbody>
+                {openTrades.length === 0 && <tr><td colSpan={7} className="sub">No open Kalshi trades.</td></tr>}
+                {openTrades.map((t) => (
+                  <tr key={t.id}>
+                    <td>{t.market_title}</td>
+                    <td className={t.direction === "YES" ? "pos" : "neg"}>{t.direction}</td>
+                    <td>{t.entry_price.toFixed(3)}</td>
+                    <td>{(t.current_price ?? t.entry_price).toFixed(3)}</td>
+                    <td>{t.amount.toFixed(2)}</td>
+                    <td className={t.pnl >= 0 ? "pos" : "neg"}>{t.pnl.toFixed(4)}</td>
+                    <td>{t.status}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
-        <table>
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th>Kalshi PnL</th>
-              <th>Polymarket PnL</th>
-              <th>Combined PnL</th>
-              <th>Trades</th>
-            </tr>
-          </thead>
-          <tbody>
-            {report && report.combined.length === 0 && (
-              <tr><td colSpan={5} className="sub">No closed trades in the window.</td></tr>
-            )}
-            {report?.combined.map((row, i) => {
-              const k = report.series.kalshi?.[i]?.pnl ?? 0;
-              const pm = report.series.polymarket?.[i]?.pnl ?? 0;
-              return (
-                <tr key={row.date}>
-                  <td>{row.date}</td>
-                  <td style={{ color: k >= 0 ? "#4ade80" : "#ff7b7b" }}>${k.toFixed(4)}</td>
-                  <td style={{ color: pm >= 0 ? "#4ade80" : "#ff7b7b" }}>${pm.toFixed(4)}</td>
-                  <td style={{ color: row.pnl >= 0 ? "#4ade80" : "#ff7b7b" }}>${row.pnl.toFixed(4)}</td>
-                  <td>{row.trades}</td>
+
+        <div className="operator-card">
+          <h3>Strategy & Risk</h3>
+          <div className="operator-kv"><span>MODE</span><strong>{modeBadge(k?.mode_guard.mode || "paper")}</strong></div>
+          <div className="operator-kv"><span>STATE</span><strong className={running ? "pos" : "neg"}>{running ? "RUNNING" : "STOPPED"}</strong></div>
+          <div className="operator-kv"><span>UPTIME</span><strong>{k?.uptime_seconds ?? 0}s</strong></div>
+          <div className="operator-kv"><span>SCAN TODAY</span><strong>{k?.scanned_today ?? 0}</strong></div>
+          <div className="operator-kv"><span>KILL SWITCH</span><strong>{k?.mode_guard.kill_switch ? "ON" : "OFF"}</strong></div>
+          <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+            <button className="btn btn-secondary" onClick={armOrPaper} disabled={busy || !k?.mode_guard.live_enabled}>
+              {live ? "BACK TO PAPER" : k?.mode_guard.mode === "live_requested" ? "CONFIRM LIVE" : "REQUEST LIVE"}
+            </button>
+            <button className="btn btn-secondary" onClick={stop} disabled={busy}>STOP</button>
+          </div>
+        </div>
+      </div>
+
+      <div className="operator-card" style={{ marginTop: 12 }}>
+        <h3>Execution Log Runner</h3>
+        <div className="operator-log">
+          {logs.map((l, i) => (
+            <div key={`${l.id || i}`} className="operator-log-row">
+              <span className="ts">{new Date(l.ts || l.created_at || Date.now()).toLocaleTimeString()}</span>
+              <span className="platform">KALSHI</span>
+              <span className={l.level === "ERROR" ? "neg" : "pos"}>[{l.level}]</span>
+              <span className="msg">{l.message}</span>
+              <span className="age"> </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="operator-card" style={{ marginTop: 12 }}>
+        <h3>Recently Closed Trades</h3>
+        <div className="operator-table-wrap">
+          <table>
+            <thead>
+              <tr><th>Market</th><th>Side</th><th>Entry</th><th>Size</th><th>Result</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              {closedTrades.length === 0 && <tr><td colSpan={6} className="sub">No closed trades.</td></tr>}
+              {closedTrades.map((t) => (
+                <tr key={t.id}>
+                  <td>{t.market_title}</td>
+                  <td>{t.direction}</td>
+                  <td>{t.entry_price.toFixed(3)}</td>
+                  <td>{t.amount.toFixed(2)}</td>
+                  <td className={t.pnl >= 0 ? "pos" : "neg"}>{t.pnl.toFixed(4)}</td>
+                  <td>{t.status}</td>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );

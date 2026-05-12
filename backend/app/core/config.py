@@ -10,7 +10,8 @@ _ENV_PATH = Path(__file__).resolve().parents[3] / ".env"
 if os.getenv("AMTA_TESTING") != "1":
     for _k, _v in dotenv_values(_ENV_PATH).items():
         if _v:
-            os.environ[_k] = _v
+            # Never clobber already-provided runtime env vars (Railway/prod).
+            os.environ.setdefault(_k, _v)
 
 
 class Settings(BaseSettings):
@@ -78,15 +79,30 @@ class Settings(BaseSettings):
     # liquidity by default and lean on AI score instead.
     POLYMARKET_MICRO_MIN_VOLUME: float = 0.0
     POLYMARKET_MAX_OPENS_PER_TICK: int = 12
+    # When true, disable Mode-B path and force Mode-A logic for all entries.
+    POLYMARKET_FORCE_MODE_A: bool = True
     # Skip entries where the favorite is weaker than this — markets with the
     # winning side priced below this floor are essentially coin flips and
     # contributed ~67% of full losses in the last 200-trade window.
     POLYMARKET_MIN_FAVORITE_PRICE: float = 0.60
+    # MODE-A underdog entry ceiling (was hardcoded at 0.20).
+    POLYMARKET_MODE_A_MAX_UNDERDOG_PRICE: float = 0.20
     # 0 = EOA, 1 = POLY_PROXY (Magic email login), 2 = POLY_GNOSIS_SAFE (browser wallet).
     # Browser-wallet accounts (MetaMask etc.) need 2; Magic accounts need 1.
     POLYMARKET_SIGNATURE_TYPE: int = 2
     POLYMARKET_STARTING_BALANCE: float = 20.00
     POLYMARKET_MAX_DAILY_LOSS_USD: float = 6.00
+    POLYMARKET_VAULT_ENABLED: bool = False
+    POLYMARKET_VAULT_TRADE_CAP_USD: float = 30.00
+    POLY_LIVE_VAULT_ENABLED: bool = False
+    POLY_LIVE_AUTO_WITHDRAW_ENABLED: bool = False
+    POLY_LIVE_TRADE_CAP_USD: float = 30.00
+    POLY_LIVE_WITHDRAW_THRESHOLD_USD: float = 25.00
+    POLY_LIVE_WITHDRAW_COOLDOWN_MIN: int = 360
+    POLY_LIVE_DAILY_WITHDRAW_CAP_USD: float = 300.00
+    POLY_LIVE_VAULT_KEEP_BUFFER_USD: float = 5.00
+    POLY_LIVE_MIN_WITHDRAW_USD: float = 5.00
+    POLY_LIVE_WITHDRAW_MAX_ATTEMPTS: int = 5
 
     POLYMARKET_PRIVATE_KEY: str = "0xe7ddd4fd0284c3d96e8bdcaffcfd83669f85c87c6302bfe684ab04795d872eb7"
     POLYMARKET_FUNDER_ADDRESS: str = ""
@@ -100,6 +116,9 @@ class Settings(BaseSettings):
     # Leave empty to use the direct path. Only the v2 ClobClient HTTP traffic
     # is routed through it; OpenAI, Gamma, and other outbound calls are not.
     POLYMARKET_PROXY_URL: str = ""
+    # Comma-separated PolyTrade IDs to hide from LIVE dashboards/reports if
+    # they were created during known bad runtime windows.
+    POLYMARKET_LIVE_EXCLUDE_TRADE_IDS: str = ""
 
     KALSHI_MAX_DAILY_LOSS_USD: float = 15.00
     KALSHI_LIVE_ENABLED: bool = False
