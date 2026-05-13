@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     LOCAL_ANALYZER_USE_RAG: bool = False
     # When True, skip all scoring and deterministically BUY the favorite side
     # (the higher-priced contract = lower payout = portal's recommendation).
-    BYPASS_ANALYZER_BUY_FAVORITE: bool = True
+    BYPASS_ANALYZER_BUY_FAVORITE: bool = False
     GEMINI_REVIEW_ENABLED: bool = False
     GEMINI_MODEL: str = "gemini-2.5-flash"
     GEMINI_REVIEW_MIN_SCORE: int = 85
@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     POLYMARKET_MAX_OPENS_PER_TICK: int = 12
     # When true, disable Mode-B path and force Mode-A logic for all entries.
     POLYMARKET_FORCE_MODE_A: bool = True
+    POLYMARKET_REQUIRE_HTF_BIAS: bool = True
+    POLYMARKET_REQUIRE_LIQUIDITY_SWEEP: bool = True
+    POLYMARKET_MIN_CONFIDENCE: float = 0.55
+    POLYMARKET_MIN_VOL_RATIO: float = 1.00
     # Skip entries where the favorite is weaker than this — markets with the
     # winning side priced below this floor are essentially coin flips and
     # contributed ~67% of full losses in the last 200-trade window.

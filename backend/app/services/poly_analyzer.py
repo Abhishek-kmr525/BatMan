@@ -194,6 +194,46 @@ def candle_features(candles: list[dict]) -> dict[str, Any]:
     }
 
 
+def liquidity_sweep_flags(candles: list[dict], lookback: int = 12) -> dict[str, bool]:
+    if len(candles) < max(lookback + 2, 6):
+        return {"bull_liquidity_sweep": False, "bear_liquidity_sweep": False}
+    last = candles[-1]
+    prev = candles[-(lookback + 1):-1]
+    prev_low = min(c["low"] for c in prev)
+    prev_high = max(c["high"] for c in prev)
+    bull = (last["low"] < prev_low) and (last["close"] > prev_low)
+    bear = (last["high"] > prev_high) and (last["close"] < prev_high)
+    return {"bull_liquidity_sweep": bull, "bear_liquidity_sweep": bear}
+
+
+async def htf_bias_features(symbol: str) -> dict[str, Any]:
+    # We approximate HTF trend from 15m candles to avoid expanding feed surface:
+    # 1H proxy -> last 20 candles (~5h trend)
+    # 4H proxy -> last 80 candles (~20h trend)
+    c15, src = await fetch_candles(symbol, "15m", limit=120)
+    if len(c15) < 90:
+        return {
+            "htf_source": src,
+            "htf_bias": "unknown",
+            "htf_align_up": False,
+            "htf_align_down": False,
+        }
+    p1_start, p1_end = c15[-20]["close"], c15[-1]["close"]
+    p4_start, p4_end = c15[-80]["close"], c15[-1]["close"]
+    d1 = (p1_end - p1_start) / p1_start if p1_start else 0.0
+    d4 = (p4_end - p4_start) / p4_start if p4_start else 0.0
+    up = d1 > 0 and d4 > 0
+    down = d1 < 0 and d4 < 0
+    return {
+        "htf_source": src,
+        "htf_1h_pct_proxy": round(d1 * 100, 4),
+        "htf_4h_pct_proxy": round(d4 * 100, 4),
+        "htf_bias": "up" if up else ("down" if down else "mixed"),
+        "htf_align_up": up,
+        "htf_align_down": down,
+    }
+
+
 # ---------- Knowledge ----------
 
 def cheatsheet_chunks(asset: str | None, interval: str | None) -> list[dict]:
@@ -239,6 +279,9 @@ def heuristic_decision(
     downs = feats.get("downs_last6", 0)
     vol_ratio = feats.get("vol_ratio", 1.0)
     body = feats.get("last_body_pct", 0.0)
+    bull_sweep = bool(feats.get("bull_liquidity_sweep"))
+    bear_sweep = bool(feats.get("bear_liquidity_sweep"))
+    htf_bias = str(feats.get("htf_bias") or "unknown")
 
     # Direction blend: window trend + recent momentum + last candle body.
     direction = 0.5 * pct + 0.3 * pct_recent + 0.2 * body
@@ -247,6 +290,12 @@ def heuristic_decision(
     else:
         action = "BUY_NO"   # NO = "Down"
 
+    # Liquidity sweep tilt
+    if bull_sweep and not bear_sweep:
+        direction += 0.25
+    if bear_sweep and not bull_sweep:
+        direction -= 0.25
+
     strength = min(1.0, abs(direction) / 0.6 + abs(ups - downs) * 0.08)
     vol_boost = min(0.2, max(0.0, (vol_ratio - 1.0) * 0.1))
     confidence = round(min(0.95, 0.45 + 0.4 * strength + vol_boost), 4)
@@ -254,6 +303,14 @@ def heuristic_decision(
     # Score in 0..100. Floor at 50 so very weak signals are still ranked.
     score = int(round(50 + 45 * strength + 5 * (vol_boost / 0.2)))
     score = max(0, min(99, score))
+
+    # HTF alignment bonus/penalty.
+    if htf_bias == "up" and action == "BUY_YES":
+        score += 4
+    elif htf_bias == "down" and action == "BUY_NO":
+        score += 4
+    elif htf_bias in {"up", "down"}:
+        score -= 6
 
     # Penalize if implied price already strongly disagrees with our direction.
     yes = market.yes_price
@@ -264,7 +321,8 @@ def heuristic_decision(
 
     reasoning = (
         f"win%={pct:+.2f}% recent6={pct_recent:+.2f}% bias={direction:+.3f} "
-        f"ups={ups}/downs={downs} vol×{vol_ratio:.2f} body={body:+.2f}%"
+        f"ups={ups}/downs={downs} vol×{vol_ratio:.2f} body={body:+.2f}% "
+        f"sweep(bull={int(bull_sweep)},bear={int(bear_sweep)}) htf={htf_bias}"
     )
     return max(0, score), action, confidence, reasoning
 
@@ -378,6 +436,9 @@ async def analyze_polymarket(market: PolyMarket) -> PolyAnalysis:
         candles, candle_source = await fetch_candles(asset, interval, limit=60)
     feats = candle_features(candles)
     feats["candle_source"] = candle_source
+    feats.update(liquidity_sweep_flags(candles))
+    if asset:
+        feats.update(await htf_bias_features(asset))
     chunks = cheatsheet_chunks(asset, interval)
     sources = [
         f"{(c.get('metadata') or {}).get('file_name','?')} p.{(c.get('metadata') or {}).get('page','?')}"
