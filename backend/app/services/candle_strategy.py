@@ -540,6 +540,50 @@ async def analyze_symbol_hf_scalp_v3(symbol: str) -> CandleSignal:
         direction = "SHORT"
         bos_meta = meta_short
     if direction == "SKIP":
+        # Ultra-loose paper fallback: momentum breakout without BOS.
+        recent = klines[-21:-1]
+        if recent:
+            hh = max(k["h"] for k in recent)
+            ll = min(k["l"] for k in recent)
+            up_break = last["c"] > hh and body_ratio >= 0.40
+            dn_break = last["c"] < ll and body_ratio >= 0.40
+            if up_break or dn_break:
+                direction = "LONG" if up_break else "SHORT"
+                bos_meta = {"breakout_high": round(hh, 4), "breakout_low": round(ll, 4), "ultra_loose": True}
+                confidence = 0.44
+                if vol_ok:
+                    confidence += 0.05
+                if direction == "LONG" and htf_bias == "up":
+                    confidence += 0.04
+                if direction == "SHORT" and htf_bias == "down":
+                    confidence += 0.04
+                confidence = max(0.40, min(0.70, confidence))
+                entry = last["c"]
+                if direction == "LONG":
+                    stop_loss = round(min(k["l"] for k in klines[-4:]) * 0.998, 4)
+                    risk = entry - stop_loss
+                    take_profit = round(entry + risk * rr_target, 4)
+                else:
+                    stop_loss = round(max(k["h"] for k in klines[-4:]) * 1.002, 4)
+                    risk = stop_loss - entry
+                    take_profit = round(entry - risk * rr_target, 4)
+                if risk > 0:
+                    rr_actual = (take_profit - entry) / risk if direction == "LONG" else (entry - take_profit) / risk
+                    return CandleSignal(
+                        direction=direction,
+                        confidence=round(confidence, 3),
+                        entry_price=entry,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                        rr_ratio=round(rr_actual, 3),
+                        htf_bias=htf_bias,
+                        setup_type="hf_ultra_loose_v3",
+                        reasoning=(
+                            f"hf ultra {direction}: breakout w/o BOS body={body_ratio:.2f}, "
+                            f"HTF={htf_bias}, vol_ratio={vol_meta.get('ratio', 0):.2f}"
+                        ),
+                        meta={**htf_meta, **bos_meta, **vol_meta, "body_ratio": round(body_ratio, 3)},
+                    )
         return CandleSignal(
             direction="SKIP",
             htf_bias=htf_bias,
