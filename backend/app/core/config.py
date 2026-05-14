@@ -147,6 +147,7 @@ class Settings(BaseSettings):
     CANDLE_SWEEP_LOOKBACK: int = 20  # candles to look back for liquidity sweeps
     CANDLE_BOS_LOOKBACK: int = 10  # candles for break-of-structure detection
     CANDLE_VOLUME_MULTIPLIER: float = 1.3  # min volume vs 20-candle avg
+    CANDLE_MIN_CONFIDENCE: float = 0.45
     CANDLE_MAX_OPEN_POSITIONS: int = 2
     CANDLE_MAX_NEW_POSITIONS_PER_TICK: int = 3
     CANDLE_MAX_DAILY_LOSS_USD: float = 30.00

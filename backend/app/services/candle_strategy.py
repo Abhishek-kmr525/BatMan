@@ -230,6 +230,42 @@ async def analyze_symbol(symbol: str) -> CandleSignal:
     last_close = klines[-1]["c"]
 
     if sweep == "none":
+        # Fallback path to increase opportunity count:
+        # allow continuation entries when HTF is directional + BOS + volume confirm.
+        if htf_bias in {"up", "down"}:
+            fallback_dir: Direction = "LONG" if htf_bias == "up" else "SHORT"
+            bos_ok_fb, bos_meta_fb = detect_bos(klines, fallback_dir, lookback=bos_lookback)
+            vol_ok_fb, vol_meta_fb = volume_confirmation(klines, multiplier=max(1.1, vol_mult - 0.15))
+            if bos_ok_fb and vol_ok_fb:
+                entry = last_close
+                if fallback_dir == "LONG":
+                    stop_loss = round(min(k["l"] for k in klines[-6:]) * 0.998, 4)
+                    risk = entry - stop_loss
+                    take_profit = round(entry + risk * rr_target, 4)
+                else:
+                    stop_loss = round(max(k["h"] for k in klines[-6:]) * 1.002, 4)
+                    risk = stop_loss - entry
+                    take_profit = round(entry - risk * rr_target, 4)
+                if risk > 0 and take_profit > 0:
+                    rr_actual_fb = (
+                        (take_profit - entry) / risk if fallback_dir == "LONG"
+                        else (entry - take_profit) / risk
+                    )
+                    return CandleSignal(
+                        direction=fallback_dir,
+                        confidence=0.50,
+                        entry_price=entry,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                        rr_ratio=round(rr_actual_fb, 3),
+                        htf_bias=htf_bias,
+                        setup_type="trend_bos_fallback",
+                        reasoning=(
+                            f"fallback {fallback_dir} via HTF trend + BOS + volume "
+                            f"(vol_ratio={vol_meta_fb.get('ratio', 0):.2f})"
+                        ),
+                        meta={**htf_meta, **sweep_meta, **bos_meta_fb, **vol_meta_fb},
+                    )
         return CandleSignal(
             direction="SKIP",
             htf_bias=htf_bias,
@@ -303,13 +339,13 @@ async def analyze_symbol(symbol: str) -> CandleSignal:
     rr_actual = (take_profit - last_close) / risk if intended_direction == "LONG" else (last_close - take_profit) / risk
 
     # Require minimum confidence floor.
-    if confidence < 0.55:
+    if confidence < settings.CANDLE_MIN_CONFIDENCE:
         return CandleSignal(
             direction="SKIP",
             htf_bias=htf_bias,
             setup_type=sweep,
             confidence=confidence,
-            reasoning=f"confidence {confidence:.2f} below 0.55 floor",
+            reasoning=f"confidence {confidence:.2f} below {settings.CANDLE_MIN_CONFIDENCE:.2f} floor",
             meta={**htf_meta, **sweep_meta, **bos_meta, **vol_meta},
         )
 
