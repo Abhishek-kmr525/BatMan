@@ -211,6 +211,8 @@ class CandleBot:
 
         self.state = "ANALYZING"
         signals_found = 0
+        opened_this_tick = 0
+        max_new = max(1, int(settings.CANDLE_MAX_NEW_POSITIONS_PER_TICK))
         for sym in candidates:
             try:
                 signal = await asyncio.wait_for(
@@ -226,15 +228,17 @@ class CandleBot:
                 continue
             signals_found += 1
 
-            await self._open_position(sym, signal, live_balance=live_balance)
-            # Only open one new position per tick to throttle.
-            break
+            opened = await self._open_position(sym, signal, live_balance=live_balance)
+            if opened:
+                opened_this_tick += 1
+            if opened_this_tick >= max_new:
+                break
 
         self.last_signal_count = signals_found
 
     # ─────────────────── Open position ───────────────────────────
 
-    async def _open_position(self, symbol: str, signal, live_balance: float | None) -> None:
+    async def _open_position(self, symbol: str, signal, live_balance: float | None) -> bool:
         self.state = "EXECUTING"
         # Determine equity for risk sizing.
         async with SessionLocal() as s:
@@ -244,7 +248,7 @@ class CandleBot:
             )
         if equity <= 0:
             await self._log("INFO", f"skip {symbol}: zero equity ({equity})")
-            return
+            return False
 
         # Position size from risk per trade & SL distance.
         risk_usd = equity * settings.CANDLE_RISK_PER_TRADE_PCT
@@ -254,7 +258,7 @@ class CandleBot:
             stop_distance = signal.stop_loss - signal.entry_price
         if stop_distance <= 0:
             await self._log("INFO", f"skip {symbol}: invalid stop distance {stop_distance}")
-            return
+            return False
         # qty (base asset) = risk_usd / stop_distance
         qty = risk_usd / stop_distance
         notional_usd = qty * signal.entry_price
@@ -262,7 +266,7 @@ class CandleBot:
         # Enforce capital availability in both modes.
         if notional_usd > equity:
             await self._log("INFO", f"skip {symbol}: notional ${notional_usd:.2f} > equity ${equity:.2f}")
-            return
+            return False
 
         # Live mode: enforce exchange filters.
         if self.is_live:
@@ -279,10 +283,10 @@ class CandleBot:
             notional_usd = qty * signal.entry_price
             if notional_usd < min_notional:
                 await self._log("INFO", f"skip {symbol}: cannot meet min notional {min_notional}")
-                return
+                return False
             if notional_usd > equity:
                 await self._log("INFO", f"skip {symbol}: rounded notional ${notional_usd:.2f} > equity ${equity:.2f}")
-                return
+                return False
 
         # Place order (or simulate).
         entry_order_id = None
@@ -293,10 +297,10 @@ class CandleBot:
             else:
                 # Spot bot: SHORT not supported on spot — skip.
                 await self._log("INFO", f"skip {symbol}: SHORT not supported on Binance Spot")
-                return
+                return False
             if not res.get("ok"):
                 await self._log("ERROR", f"live entry failed {symbol}: {res.get('error')}")
-                return
+                return False
             entry_order_id = str(res.get("orderId"))
             executed_price = res.get("executed_price") or signal.entry_price
             qty = res.get("executed_qty") or qty
@@ -344,6 +348,7 @@ class CandleBot:
             f"SL={sl:.4f} TP={tp:.4f} (RR={signal.rr_ratio:.2f})"
         )
         await bus.publish("candle:trade:opened", {"id": trade_id, "symbol": symbol})
+        return True
 
     # ─────────────────── Manage open positions ───────────────────
 

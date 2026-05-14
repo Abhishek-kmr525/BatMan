@@ -1967,6 +1967,60 @@ async def candle_live_wallet(session: AsyncSession = Depends(get_session)):
     return await _candle_wallet_response("live", session)
 
 
+class CandlePaperResetBody(BaseModel):
+    passcode: str
+    starting_balance: float = 20.0
+    clear_logs: bool = False
+
+
+@router.post("/candle/paper/reset")
+async def candle_paper_reset(body: CandlePaperResetBody, session: AsyncSession = Depends(get_session)):
+    """Hard reset candle paper mode: stop bot, clear paper trades, set wallet."""
+    if body.passcode != settings.LIVE_MODE_CONFIRM_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    if body.starting_balance <= 0:
+        raise HTTPException(status_code=400, detail="starting_balance must be > 0")
+
+    # Stop paper bot before data reset to avoid races.
+    await candle_paper_bot.stop()
+
+    # Clear paper trades.
+    await session.execute(delete(CandleTrade).where(CandleTrade.mode == "paper"))
+
+    # Reset wallet counters.
+    w = (await session.execute(select(CandleWallet).where(CandleWallet.id == 1))).scalar_one_or_none()
+    if w is None:
+        w = CandleWallet(id=1)
+        session.add(w)
+    w.paper_starting_balance = round(float(body.starting_balance), 6)
+    w.paper_balance = round(float(body.starting_balance), 6)
+    w.paper_total_pnl = 0.0
+    w.paper_total_trades = 0
+    w.paper_wins = 0
+    w.paper_losses = 0
+    await session.commit()
+
+    deleted_logs = 0
+    if body.clear_logs:
+        res = await session.execute(
+            delete(BotLog).where(
+                text("json_extract(metadata_json, '$.platform') = 'candle'"),
+                text("json_extract(metadata_json, '$.bot_kind') = 'paper'"),
+            )
+        )
+        await session.commit()
+        deleted_logs = int(res.rowcount or 0)
+
+    return {
+        "ok": True,
+        "starting_balance": round(float(body.starting_balance), 2),
+        "deleted_paper_trades": "all",
+        "deleted_paper_logs": deleted_logs,
+        "status": candle_paper_bot.status(),
+        "wallet": await _candle_wallet_response("paper", session),
+    }
+
+
 # ── Trades & logs ────────────────────────────────────────────────────
 
 @router.get("/candle/trades")

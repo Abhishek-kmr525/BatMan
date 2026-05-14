@@ -128,6 +128,44 @@ class Settings(BaseSettings):
     KALSHI_LIVE_ENABLED: bool = False
     POLYMARKET_LIVE_ENABLED: bool = True
     LIVE_MODE_CONFIRM_PASSCODE: str = "9472"
+
+    # ── CANDLE BOT (BTC/ETH on Binance) ───────────────────────────────
+    # Trades real crypto pairs on Binance Spot using candle strategy:
+    # HTF bias → liquidity sweep → BOS → entry on retest → 1:2 RR.
+    CANDLE_LIVE_ENABLED: bool = True
+    CANDLE_PAPER_STARTING_BALANCE: float = 1000.00
+    CANDLE_SCAN_INTERVAL_SECONDS: int = 15
+    # Pairs to trade — comma separated symbols (e.g. "BTCUSDT,ETHUSDT").
+    CANDLE_SYMBOLS: str = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
+    # Primary entry timeframe — Binance kline interval string.
+    CANDLE_PRIMARY_INTERVAL: str = "5m"
+    # Higher timeframe for bias check.
+    CANDLE_HTF_INTERVAL: str = "1h"
+    # Strategy parameters.
+    CANDLE_RISK_PER_TRADE_PCT: float = 0.01  # 1% of equity per trade
+    CANDLE_MIN_RR_RATIO: float = 2.0  # 1:2 minimum reward-to-risk
+    CANDLE_SWEEP_LOOKBACK: int = 20  # candles to look back for liquidity sweeps
+    CANDLE_BOS_LOOKBACK: int = 10  # candles for break-of-structure detection
+    CANDLE_VOLUME_MULTIPLIER: float = 1.3  # min volume vs 20-candle avg
+    CANDLE_MAX_OPEN_POSITIONS: int = 2
+    CANDLE_MAX_NEW_POSITIONS_PER_TICK: int = 3
+    CANDLE_MAX_DAILY_LOSS_USD: float = 30.00
+    CANDLE_DAILY_LOSS_COOLDOWN_MIN: int = 240  # 4 hours after hitting daily loss
+    CANDLE_MAX_CONSECUTIVE_LOSSES: int = 3
+    CANDLE_COOLDOWN_AFTER_LOSSES_MIN: int = 60
+    # Binance Spot live trading credentials. Read-only IP restriction
+    # recommended on the API key (only trading + reading permissions).
+    BINANCE_API_KEY: str = ""
+    BINANCE_API_SECRET: str = ""
+    # Use Binance testnet (testnet.binance.vision) for live mode safety check.
+    BINANCE_USE_TESTNET: bool = False
+    # Override Binance base URL (used to route through relay if geo-blocked).
+    # Example: https://relay.cadnow.net/binance
+    BINANCE_HOST: str = ""
+    # Canary limits for live mode.
+    CANDLE_CANARY_MAX_ORDER_USD: float = 5.00
+    CANDLE_CANARY_MAX_NEW_TRADES_PER_DAY: int = 10
+    CANDLE_CANARY_MAX_TOTAL_EXPOSURE_USD: float = 25.00
     LIVE_CANARY_ENABLED: bool = True
     KALSHI_CANARY_MAX_ORDER_USD: float = 2.00
     KALSHI_CANARY_MAX_NEW_TRADES_PER_DAY: int = 5
