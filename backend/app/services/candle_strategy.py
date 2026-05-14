@@ -22,11 +22,12 @@ logger = logging.getLogger(__name__)
 
 
 Direction = Literal["LONG", "SHORT", "SKIP"]
-StrategyId = Literal["sweep_bos_v1", "smart_money_v2"]
+StrategyId = Literal["sweep_bos_v1", "smart_money_v2", "hf_scalp_v3"]
 
 SUPPORTED_STRATEGIES = {
     "sweep_bos_v1": "Sweep + BOS + volume (current)",
     "smart_money_v2": "HTF S/D + CHOCH/BOS + RSI/Stoch + 3R",
+    "hf_scalp_v3": "High Frequency (paper): HTF-lite + BOS momentum",
 }
 
 
@@ -497,6 +498,93 @@ async def analyze_symbol_smart_money_v2(symbol: str) -> CandleSignal:
 
 
 async def analyze_symbol_with_strategy(symbol: str, strategy_id: StrategyId) -> CandleSignal:
+    if strategy_id == "hf_scalp_v3":
+        return await analyze_symbol_hf_scalp_v3(symbol)
     if strategy_id == "smart_money_v2":
         return await analyze_symbol_smart_money_v2(symbol)
     return await analyze_symbol(symbol)
+
+
+async def analyze_symbol_hf_scalp_v3(symbol: str) -> CandleSignal:
+    """Aggressive signal profile intended for PAPER mode testing.
+
+    Rules:
+    - No mandatory liquidity sweep.
+    - Prefer HTF alignment but do not hard-reject mixed/conflict.
+    - Require BOS + momentum body + light volume check.
+    - Keep SL/TP + RR discipline.
+    """
+    primary = settings.CANDLE_PRIMARY_INTERVAL
+    rr_target = max(1.8, settings.CANDLE_MIN_RR_RATIO)
+    htf_bias, htf_meta = await get_htf_bias(symbol)
+    klines = await binance_data.get_klines(symbol, primary, limit=220)
+    if len(klines) < 80:
+        return CandleSignal(direction="SKIP", reasoning=f"insufficient {primary} candles ({len(klines)})")
+
+    last = klines[-1]
+    body = abs(last["c"] - last["o"])
+    rng = max(1e-9, last["h"] - last["l"])
+    body_ratio = body / rng
+
+    bos_long, meta_long = detect_bos(klines, "LONG", lookback=max(6, settings.CANDLE_BOS_LOOKBACK - 2))
+    bos_short, meta_short = detect_bos(klines, "SHORT", lookback=max(6, settings.CANDLE_BOS_LOOKBACK - 2))
+    vol_ok, vol_meta = volume_confirmation(klines, multiplier=max(1.0, settings.CANDLE_VOLUME_MULTIPLIER - 0.2))
+
+    # Direction choice: BOS + candle body impulse.
+    direction: Direction = "SKIP"
+    bos_meta = {}
+    if bos_long and body_ratio >= 0.45 and last["c"] >= last["o"]:
+        direction = "LONG"
+        bos_meta = meta_long
+    elif bos_short and body_ratio >= 0.45 and last["c"] <= last["o"]:
+        direction = "SHORT"
+        bos_meta = meta_short
+    if direction == "SKIP":
+        return CandleSignal(
+            direction="SKIP",
+            htf_bias=htf_bias,
+            reasoning="hf: no BOS impulse",
+            meta={**htf_meta, **vol_meta, "body_ratio": round(body_ratio, 3)},
+        )
+
+    # Soft HTF penalty (not hard block).
+    confidence = 0.52
+    if htf_bias == "mixed":
+        confidence -= 0.04
+    elif (direction == "LONG" and htf_bias == "up") or (direction == "SHORT" and htf_bias == "down"):
+        confidence += 0.10
+    else:
+        confidence -= 0.06
+    if vol_ok:
+        confidence += 0.08
+    confidence = max(0.40, min(0.92, confidence))
+
+    entry = last["c"]
+    if direction == "LONG":
+        stop_loss = round(min(k["l"] for k in klines[-5:]) * 0.998, 4)
+        risk = entry - stop_loss
+        take_profit = round(entry + risk * rr_target, 4)
+    else:
+        stop_loss = round(max(k["h"] for k in klines[-5:]) * 1.002, 4)
+        risk = stop_loss - entry
+        take_profit = round(entry - risk * rr_target, 4)
+    if risk <= 0:
+        return CandleSignal(direction="SKIP", htf_bias=htf_bias, reasoning="hf: invalid risk levels")
+
+    rr_actual = (take_profit - entry) / risk if direction == "LONG" else (entry - take_profit) / risk
+
+    return CandleSignal(
+        direction=direction,
+        confidence=round(confidence, 3),
+        entry_price=entry,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        rr_ratio=round(rr_actual, 3),
+        htf_bias=htf_bias,
+        setup_type="hf_scalp_v3",
+        reasoning=(
+            f"hf {direction}: BOS impulse body={body_ratio:.2f}, HTF={htf_bias}, "
+            f"vol_ratio={vol_meta.get('ratio', 0):.2f}"
+        ),
+        meta={**htf_meta, **bos_meta, **vol_meta, "body_ratio": round(body_ratio, 3)},
+    )
