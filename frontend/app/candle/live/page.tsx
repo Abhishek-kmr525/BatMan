@@ -213,7 +213,13 @@ export default function CandleLivePage() {
 
   const running = bot?.status === "running";
   const balance = wallet?.balance ?? 0;
-  const equity = balance + openTrades.reduce((acc, t) => acc + (t.notional_usd ?? 0), 0);
+  const equity = balance + openTrades.reduce((acc, t) => {
+    const now = t.current_price ?? t.entry_price;
+    const pnl = t.direction === "LONG"
+      ? (now - t.entry_price) * t.qty
+      : (t.entry_price - now) * t.qty;
+    return acc + pnl;
+  }, 0);
   const totalPnl = wallet?.total_pnl ?? 0;
   const winRate = wallet?.win_rate ?? 0;
   const isArmed = mode?.mode === "live_armed";

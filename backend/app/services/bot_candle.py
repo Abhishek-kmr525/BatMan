@@ -259,7 +259,12 @@ class CandleBot:
         qty = risk_usd / stop_distance
         notional_usd = qty * signal.entry_price
 
-        # Live mode: enforce min notional & verify balance covers entry.
+        # Enforce capital availability in both modes.
+        if notional_usd > equity:
+            await self._log("INFO", f"skip {symbol}: notional ${notional_usd:.2f} > equity ${equity:.2f}")
+            return
+
+        # Live mode: enforce exchange filters.
         if self.is_live:
             filters = await binance_live.get_symbol_filters(symbol)
             min_notional = filters.get("minNotional", 5.0)
@@ -276,7 +281,7 @@ class CandleBot:
                 await self._log("INFO", f"skip {symbol}: cannot meet min notional {min_notional}")
                 return
             if notional_usd > equity:
-                await self._log("INFO", f"skip {symbol}: notional ${notional_usd:.2f} > equity ${equity:.2f}")
+                await self._log("INFO", f"skip {symbol}: rounded notional ${notional_usd:.2f} > equity ${equity:.2f}")
                 return
 
         # Place order (or simulate).
