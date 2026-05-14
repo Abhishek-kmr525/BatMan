@@ -150,6 +150,9 @@ class Settings(BaseSettings):
     CANDLE_MIN_CONFIDENCE: float = 0.45
     CANDLE_MAX_OPEN_POSITIONS: int = 2
     CANDLE_MAX_NEW_POSITIONS_PER_TICK: int = 3
+    # Paper-mode position sizing cap to keep small wallets active.
+    CANDLE_PAPER_MAX_NOTIONAL_USD: float = 5.0
+    CANDLE_PAPER_MAX_NOTIONAL_PCT_EQUITY: float = 0.25
     CANDLE_MAX_DAILY_LOSS_USD: float = 30.00
     CANDLE_DAILY_LOSS_COOLDOWN_MIN: int = 240  # 4 hours after hitting daily loss
     CANDLE_MAX_CONSECUTIVE_LOSSES: int = 3

@@ -263,6 +263,16 @@ class CandleBot:
         qty = risk_usd / stop_distance
         notional_usd = qty * signal.entry_price
 
+        # Paper mode: cap notional for small wallets, then resize qty.
+        if not self.is_live:
+            cap_abs = float(settings.CANDLE_PAPER_MAX_NOTIONAL_USD)
+            cap_pct = float(settings.CANDLE_PAPER_MAX_NOTIONAL_PCT_EQUITY) * equity
+            cap = max(0.0, min(cap_abs, cap_pct if cap_pct > 0 else cap_abs))
+            if cap > 0 and notional_usd > cap:
+                notional_usd = cap
+                qty = notional_usd / signal.entry_price
+                await self._log("INFO", f"paper cap {symbol}: resized notional to ${notional_usd:.2f}")
+
         # Enforce capital availability in both modes.
         if notional_usd > equity:
             await self._log("INFO", f"skip {symbol}: notional ${notional_usd:.2f} > equity ${equity:.2f}")
