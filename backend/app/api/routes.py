@@ -19,11 +19,13 @@ from app.agent import knowledge
 from app.agent.analyzer import analyze_market, check_claude_health, check_gemini_health
 from app.core.config import settings
 from app.core.db import get_session
-from app.models.models import BotLog, PolyTrade, PolyVaultEvent, PolyWithdrawJob, Trade
+from app.models.models import BotLog, CandleTrade, CandleWallet, PolyTrade, PolyVaultEvent, PolyWithdrawJob, Trade
 from app.services import executor as exec_svc
 from app.services import poly_wallet, strategies, wallet
 from app.services.bot import bot
 from app.services.bot_polymarket import poly_bot, poly_live_bot, poly_paper_bot
+from app.services.bot_candle import candle_live_bot, candle_paper_bot
+from app.services import binance_data, binance_live, candle_strategy as candle_strat
 from app.services.events import bus
 from app.services.intel import gather_market_intel
 from app.services.kalshi import get_kalshi
@@ -202,8 +204,104 @@ async def maintenance_storage_cleanup(
     except Exception:
         await session.rollback()
 
-    await bus.publish("maintenance:storage:cleanup", {"deleted_logs": deleted_logs, "keep_recent_logs": keep_recent})
-    return {"ok": True, "deleted_logs": deleted_logs, "keep_recent_logs": keep_recent}
+    await bus.publish("maintenance:storage:cleanup", {"deleted_logs": deleted_logs, "keep_recent_logs": body.keep_recent_logs})
+    return {"ok": True, "deleted_logs": deleted_logs, "keep_recent_logs": body.keep_recent_logs}
+
+
+class MaintenanceDeleteFileBody(BaseModel):
+    passcode: str
+    paths: list[str]
+
+
+@router.post("/maintenance/storage/delete-files")
+async def maintenance_delete_files(body: MaintenanceDeleteFileBody):
+    """Delete specific files to free disk space. Use to reclaim large PDFs/caches."""
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    removed: list[dict] = []
+    failed: list[dict] = []
+    for p in body.paths:
+        try:
+            if os.path.isfile(p):
+                size = os.path.getsize(p)
+                os.remove(p)
+                removed.append({"path": p, "freed_bytes": size})
+            else:
+                failed.append({"path": p, "error": "not_a_file_or_missing"})
+        except Exception as e:
+            failed.append({"path": p, "error": str(e)[:200]})
+    return {"ok": len(failed) == 0, "removed": removed, "failed": failed}
+
+
+@router.post("/maintenance/storage/emergency-purge")
+async def maintenance_emergency_purge(body: MaintenanceReclaimBody):
+    """Disk-full emergency: use a raw aiosqlite connection bypassing SQLAlchemy
+    transaction overhead, set temp_store + journal to MEMORY so no disk write
+    is needed, then DROP + recreate bot_logs and VACUUM into RAM."""
+    if body.passcode != settings.MAINTENANCE_PASSCODE:
+        raise HTTPException(status_code=401, detail="invalid passcode")
+    import aiosqlite
+    db_path = "/data/amta.db"
+    actions: list[str] = []
+    try:
+        size_before = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+        actions.append(f"db_size_before={size_before/1024/1024:.2f}MB")
+        async with aiosqlite.connect(db_path) as conn:
+            # Configure SQLite to avoid all disk writes for journal/temp.
+            for pragma in [
+                "PRAGMA temp_store=MEMORY",
+                "PRAGMA cache_size=-200000",  # ~200MB cache
+                "PRAGMA journal_mode=MEMORY",
+                "PRAGMA synchronous=OFF",
+                "PRAGMA locking_mode=EXCLUSIVE",
+            ]:
+                try:
+                    await conn.execute(pragma)
+                    actions.append(pragma)
+                except Exception as e:
+                    actions.append(f"{pragma}_failed: {str(e)[:80]}")
+            # Drop heavy bot_logs.
+            try:
+                await conn.execute("DROP TABLE IF EXISTS bot_logs")
+                await conn.commit()
+                actions.append("dropped bot_logs")
+            except Exception as e:
+                actions.append(f"drop_failed: {str(e)[:120]}")
+            # Recreate empty bot_logs.
+            try:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_logs (
+                        id VARCHAR PRIMARY KEY,
+                        level VARCHAR(10) DEFAULT 'INFO',
+                        message TEXT NOT NULL,
+                        metadata_json JSON,
+                        created_at DATETIME NOT NULL
+                    )
+                """)
+                await conn.execute("CREATE INDEX IF NOT EXISTS ix_bot_logs_created_at ON bot_logs(created_at)")
+                await conn.commit()
+                actions.append("recreated bot_logs")
+            except Exception as e:
+                actions.append(f"recreate_failed: {str(e)[:120]}")
+            # Restore WAL journaling.
+            try:
+                await conn.execute("PRAGMA journal_mode=WAL")
+                await conn.execute("PRAGMA synchronous=NORMAL")
+                actions.append("restored WAL")
+            except Exception:
+                pass
+            # VACUUM with MEMORY temp_store — needs RAM equal to DB size.
+            try:
+                await conn.execute("VACUUM")
+                actions.append("VACUUM ok")
+            except Exception as e:
+                actions.append(f"vacuum_failed: {str(e)[:120]}")
+        size_after = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+        actions.append(f"db_size_after={size_after/1024/1024:.2f}MB")
+        actions.append(f"freed={(size_before - size_after)/1024/1024:.2f}MB")
+        return {"ok": True, "actions": actions}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300], "actions": actions}
 
 
 @router.post("/maintenance/storage/reclaim")
@@ -482,7 +580,7 @@ async def mode_status():
 @router.post("/mode/request-live")
 async def mode_request_live(body: ModeRequestBody):
     platform = body.platform.lower()
-    if platform not in {"kalshi", "polymarket"}:
+    if platform not in {"kalshi", "polymarket", "candle"}:
         raise HTTPException(status_code=400, detail="invalid platform")
     result = mode_guard.request_live(platform)  # type: ignore[arg-type]
     if not result.get("ok"):
@@ -493,7 +591,7 @@ async def mode_request_live(body: ModeRequestBody):
 @router.post("/mode/confirm-live")
 async def mode_confirm_live(body: ModeConfirmBody):
     platform = body.platform.lower()
-    if platform not in {"kalshi", "polymarket"}:
+    if platform not in {"kalshi", "polymarket", "candle"}:
         raise HTTPException(status_code=400, detail="invalid platform")
     result = mode_guard.confirm_live(platform, body.passcode, body.limits)  # type: ignore[arg-type]
     if not result.get("ok"):
@@ -504,7 +602,7 @@ async def mode_confirm_live(body: ModeConfirmBody):
 @router.post("/mode/set-paper")
 async def mode_set_paper(body: ModeSetPaperBody):
     platform = body.platform.lower()
-    if platform not in {"kalshi", "polymarket"}:
+    if platform not in {"kalshi", "polymarket", "candle"}:
         raise HTTPException(status_code=400, detail="invalid platform")
     return mode_guard.set_paper(platform)  # type: ignore[arg-type]
 
@@ -512,7 +610,7 @@ async def mode_set_paper(body: ModeSetPaperBody):
 @router.post("/mode/kill-switch")
 async def mode_kill_switch(body: KillSwitchBody):
     platform = body.platform.lower()
-    if platform not in {"kalshi", "polymarket"}:
+    if platform not in {"kalshi", "polymarket", "candle"}:
         raise HTTPException(status_code=400, detail="invalid platform")
     return mode_guard.set_kill_switch(platform, body.enabled)  # type: ignore[arg-type]
 
@@ -1685,3 +1783,258 @@ async def _time_to_close_seconds(kalshi, market_id: str) -> int | None:
     value = market.close_time_seconds if market is not None else None
     _MARKET_CLOSE_CACHE[market_id] = (now, value)
     return value
+
+
+# ════════════════════════════════════════════════════════════════════
+# CANDLE BOT — BTC/ETH crypto strategy with Binance data + execution
+# ════════════════════════════════════════════════════════════════════
+
+
+# ── Market data (public, no auth) ────────────────────────────────────
+class CandleBotStartBody(BaseModel):
+    strategy_id: str
+
+
+@router.get("/candle/strategies")
+async def candle_strategies():
+    return {
+        "default": "sweep_bos_v1",
+        "items": [
+            {"id": k, "label": v} for k, v in candle_strat.SUPPORTED_STRATEGIES.items()
+        ],
+    }
+
+
+@router.get("/candle/klines")
+async def candle_klines(symbol: str = "BTCUSDT", interval: str = "5m", limit: int = 200):
+    """Fetch OHLCV candles from Binance public API (proxied)."""
+    klines = await binance_data.get_klines(symbol=symbol, interval=interval, limit=limit)
+    return {"symbol": symbol.upper(), "interval": interval, "candles": klines}
+
+
+@router.get("/candle/price")
+async def candle_price(symbol: str = "BTCUSDT"):
+    price = await binance_data.get_price(symbol)
+    return {"symbol": symbol.upper(), "price": price}
+
+
+@router.get("/candle/analyze")
+async def candle_analyze(symbol: str = "BTCUSDT", strategy_id: str = "sweep_bos_v1"):
+    """Run the strategy on demand and return the signal (does NOT trade)."""
+    if strategy_id not in candle_strat.SUPPORTED_STRATEGIES:
+        raise HTTPException(status_code=400, detail=f"unsupported strategy_id: {strategy_id}")
+    signal = await candle_strat.analyze_symbol_with_strategy(symbol, strategy_id)
+    return {
+        "symbol": symbol.upper(),
+        "strategy_id": strategy_id,
+        "direction": signal.direction,
+        "confidence": signal.confidence,
+        "entry_price": signal.entry_price,
+        "stop_loss": signal.stop_loss,
+        "take_profit": signal.take_profit,
+        "rr_ratio": signal.rr_ratio,
+        "htf_bias": signal.htf_bias,
+        "setup_type": signal.setup_type,
+        "reasoning": signal.reasoning,
+        "meta": signal.meta,
+    }
+
+
+# ── Bot control: paper ───────────────────────────────────────────────
+
+@router.post("/candle/paper/bot/start")
+async def candle_paper_bot_start(body: CandleBotStartBody):
+    if body.strategy_id not in candle_strat.SUPPORTED_STRATEGIES:
+        raise HTTPException(status_code=400, detail=f"unsupported strategy_id: {body.strategy_id}")
+    await candle_paper_bot.start(strategy_id=body.strategy_id)
+    return candle_paper_bot.status()
+
+
+@router.post("/candle/paper/bot/stop")
+async def candle_paper_bot_stop():
+    await candle_paper_bot.stop()
+    return candle_paper_bot.status()
+
+
+@router.get("/candle/paper/bot/status")
+async def candle_paper_bot_status(session: AsyncSession = Depends(get_session)):
+    s = candle_paper_bot.status()
+    res = await session.execute(
+        select(CandleTrade).where(CandleTrade.status == "OPEN", CandleTrade.mode == "paper")
+    )
+    s["active_positions"] = len(list(res.scalars().all()))
+    return s
+
+
+# ── Bot control: live ────────────────────────────────────────────────
+
+@router.post("/candle/live/bot/start")
+async def candle_live_bot_start(body: CandleBotStartBody):
+    if body.strategy_id not in candle_strat.SUPPORTED_STRATEGIES:
+        raise HTTPException(status_code=400, detail=f"unsupported strategy_id: {body.strategy_id}")
+    await candle_live_bot.start(strategy_id=body.strategy_id)
+    return candle_live_bot.status()
+
+
+@router.post("/candle/live/bot/stop")
+async def candle_live_bot_stop():
+    await candle_live_bot.stop()
+    return candle_live_bot.status()
+
+
+@router.get("/candle/live/bot/status")
+async def candle_live_bot_status(session: AsyncSession = Depends(get_session)):
+    s = candle_live_bot.status()
+    res = await session.execute(
+        select(CandleTrade).where(CandleTrade.status == "OPEN", CandleTrade.mode == "live")
+    )
+    s["active_positions"] = len(list(res.scalars().all()))
+    s["mode_guard"] = mode_guard.get("candle").to_dict()
+    return s
+
+
+# ── Wallet ───────────────────────────────────────────────────────────
+
+async def _candle_wallet_response(mode: str, session: AsyncSession) -> dict:
+    is_live = mode == "live"
+    w = (await session.execute(select(CandleWallet).where(CandleWallet.id == 1))).scalar_one_or_none()
+    if w is None:
+        w = CandleWallet(
+            id=1,
+            paper_balance=settings.CANDLE_PAPER_STARTING_BALANCE,
+            paper_starting_balance=settings.CANDLE_PAPER_STARTING_BALANCE,
+        )
+        session.add(w)
+        await session.commit()
+        w = (await session.execute(select(CandleWallet).where(CandleWallet.id == 1))).scalar_one()
+
+    live_error: str | None = None
+    live_balance = float(w.live_balance_usdt or 0.0)
+    if is_live:
+        if not (settings.BINANCE_API_KEY and settings.BINANCE_API_SECRET):
+            live_error = "Binance API credentials not configured (BINANCE_API_KEY/SECRET)"
+        else:
+            usdt, _, err = await binance_live.get_account_balance_safe()
+            if err is None:
+                live_balance = usdt
+                w.live_balance_usdt = round(usdt, 6)
+                w.live_balance_updated_at = datetime.now(timezone.utc)
+                await session.commit()
+            else:
+                live_error = err
+
+    # Stats for the requested mode.
+    if is_live:
+        balance = live_balance
+        total_pnl = float(w.live_total_pnl or 0)
+        total_trades = int(w.live_total_trades or 0)
+        wins = int(w.live_wins or 0)
+        losses = int(w.live_losses or 0)
+    else:
+        balance = float(w.paper_balance or 0)
+        total_pnl = float(w.paper_total_pnl or 0)
+        total_trades = int(w.paper_total_trades or 0)
+        wins = int(w.paper_wins or 0)
+        losses = int(w.paper_losses or 0)
+    win_rate = (wins / total_trades * 100) if total_trades else 0.0
+
+    return {
+        "mode": mode,
+        "balance": round(balance, 6),
+        "paper_starting_balance": round(float(w.paper_starting_balance or 0), 2),
+        "live_balance_updated_at": (w.live_balance_updated_at.isoformat() if w.live_balance_updated_at else None),
+        "live_error": live_error,
+        "total_pnl": round(total_pnl, 6),
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(win_rate, 2),
+        "symbols": [s.strip() for s in settings.CANDLE_SYMBOLS.split(",") if s.strip()],
+        "primary_interval": settings.CANDLE_PRIMARY_INTERVAL,
+        "htf_interval": settings.CANDLE_HTF_INTERVAL,
+        "risk_per_trade_pct": settings.CANDLE_RISK_PER_TRADE_PCT,
+        "rr_ratio": settings.CANDLE_MIN_RR_RATIO,
+    }
+
+
+@router.get("/candle/paper/wallet")
+async def candle_paper_wallet(session: AsyncSession = Depends(get_session)):
+    return await _candle_wallet_response("paper", session)
+
+
+@router.get("/candle/live/wallet")
+async def candle_live_wallet(session: AsyncSession = Depends(get_session)):
+    return await _candle_wallet_response("live", session)
+
+
+# ── Trades & logs ────────────────────────────────────────────────────
+
+@router.get("/candle/trades")
+async def candle_trades(
+    mode: str = "paper",
+    status: str = "all",  # open | closed | all
+    limit: int = 100,
+    session: AsyncSession = Depends(get_session),
+):
+    if mode not in {"paper", "live"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+    q = select(CandleTrade).where(CandleTrade.mode == mode).order_by(desc(CandleTrade.opened_at)).limit(min(limit, 500))
+    if status == "open":
+        q = select(CandleTrade).where(CandleTrade.mode == mode, CandleTrade.status == "OPEN").order_by(desc(CandleTrade.opened_at)).limit(min(limit, 500))
+    elif status == "closed":
+        q = select(CandleTrade).where(CandleTrade.mode == mode, CandleTrade.status.like("CLOSED%")).order_by(desc(CandleTrade.opened_at)).limit(min(limit, 500))
+    rows = (await session.execute(q)).scalars().all()
+    return [
+        {
+            "id": t.id,
+            "symbol": t.symbol,
+            "interval": t.interval,
+            "direction": t.direction,
+            "qty": t.qty,
+            "notional_usd": t.notional_usd,
+            "entry_price": t.entry_price,
+            "stop_loss": t.stop_loss,
+            "take_profit": t.take_profit,
+            "current_price": t.current_price,
+            "exit_price": t.exit_price,
+            "pnl_usd": t.pnl_usd,
+            "pnl_pct": t.pnl_pct,
+            "status": t.status,
+            "htf_bias": t.htf_bias,
+            "setup_type": t.setup_type,
+            "confidence": t.confidence,
+            "reasoning": t.reasoning,
+            "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+            "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+        }
+        for t in rows
+    ]
+
+
+@router.get("/candle/logs")
+async def candle_logs(
+    mode: str | None = None,
+    limit: int = 200,
+    session: AsyncSession = Depends(get_session),
+):
+    res = await session.execute(
+        select(BotLog).order_by(desc(BotLog.created_at)).limit(800)
+    )
+    rows = res.scalars().all()
+    wanted_kind = None
+    if mode and mode.lower() in {"paper", "live"}:
+        wanted_kind = mode.lower()
+    candle_rows = [
+        r for r in rows
+        if (r.metadata_json or {}).get("platform") == "candle"
+        and (wanted_kind is None or (r.metadata_json or {}).get("bot_kind") == wanted_kind)
+    ][:limit]
+    return [
+        {
+            "id": r.id,
+            "level": r.level,
+            "message": r.message,
+            "ts": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in candle_rows
+    ]
