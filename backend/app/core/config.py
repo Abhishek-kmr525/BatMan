@@ -96,6 +96,16 @@ class Settings(BaseSettings):
     POLYMARKET_PAPER_REQUIRE_LIQUIDITY_SWEEP: bool = False
     POLYMARKET_PAPER_REQUIRE_HTF_BIAS: bool = False
     POLYMARKET_PAPER_BYPASS_RISK_ENGINE: bool = True
+    # Strategy selector:
+    # - sweep_ai_v1: existing AI+sweep flow
+    # - window_edge_v1: video-style low-bid window-edge quoting (paper-first)
+    POLYMARKET_STRATEGY: str = "window_edge_v1"
+    # Window-edge strategy params (paper-first).
+    POLYMARKET_WINDOW_EDGE_BID_PRICE: float = 0.02
+    POLYMARKET_WINDOW_EDGE_BID_USD_PER_SIDE: float = 1.00
+    POLYMARKET_WINDOW_EDGE_OPEN_GRACE_SECONDS: int = 120
+    POLYMARKET_WINDOW_EDGE_CANCEL_AFTER_SECONDS: int = 120
+    POLYMARKET_WINDOW_EDGE_MAX_PENDING_PER_SIDE: int = 8
     # Skip entries where the favorite is weaker than this — markets with the
     # winning side priced below this floor are essentially coin flips and
     # contributed ~67% of full losses in the last 200-trade window.

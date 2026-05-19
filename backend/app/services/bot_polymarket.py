@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 from typing import Literal
@@ -57,6 +58,9 @@ class PolymarketBot:
         self._winner_last_sync_ts: float | None = None
         self._winner_last_activity_ts: int | None = None
         self._winner_last_count: int = 0
+        # Paper-only virtual resting quotes for window-edge strategy.
+        # key: "{market_id}:{YES|NO}" -> {side, market_id, price, amount, expires_at, created_at}
+        self._paper_window_quotes: dict[str, dict] = {}
 
     @property
     def running(self) -> bool:
@@ -283,6 +287,18 @@ class PolymarketBot:
             # the correct figure instead of a stale paper-simulation number.
             if _is_live_tick and _live_clob_balance is not None and _live_clob_balance > 0:
                 wallet.balance = round(_live_clob_balance, 4)
+
+            strategy = (getattr(settings, "POLYMARKET_STRATEGY", "sweep_ai_v1") or "sweep_ai_v1").strip().lower()
+            if strategy == "window_edge_v1" and not self.is_live_bot:
+                await self._run_window_edge_paper(
+                    s=s,
+                    candidates=candidates,
+                    open_market_ids=open_market_ids,
+                    wallet=wallet,
+                    max_open_positions=max_open_positions,
+                )
+                await s.commit()
+                return
 
             for m in candidates[:25]:
                 title_short = " ".join((m.title or "").split())
@@ -617,6 +633,136 @@ class PolymarketBot:
                 wallet = await poly_wallet.get_wallet(s)
                 if opened_this_tick >= max_per_tick:
                     break
+
+    async def _run_window_edge_paper(self, *, s, candidates, open_market_ids: set[str], wallet, max_open_positions: int) -> None:
+        """Video-style paper strategy:
+        - Place virtual low bids on BOTH sides near a new window open.
+        - Keep them live for a short period.
+        - Fill only if price touches bid.
+        - Auto-cancel remaining quotes after timeout.
+        """
+        bid_price = max(0.01, float(getattr(settings, "POLYMARKET_WINDOW_EDGE_BID_PRICE", 0.02)))
+        bid_usd = max(0.25, float(getattr(settings, "POLYMARKET_WINDOW_EDGE_BID_USD_PER_SIDE", 1.00)))
+        open_grace = max(10, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_OPEN_GRACE_SECONDS", 120)))
+        cancel_after = max(10, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_CANCEL_AFTER_SECONDS", 120)))
+        max_pending = max(1, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_MAX_PENDING_PER_SIDE", 8)))
+        now = time.time()
+
+        # 1) Expire old quotes.
+        expired = [k for k, q in self._paper_window_quotes.items() if float(q.get("expires_at", 0)) <= now]
+        for k in expired:
+            q = self._paper_window_quotes.pop(k, None)
+            if q:
+                await self._log(
+                    "INFO",
+                    f"window-edge cancel {q.get('market_id')} {q.get('side')} @ {q.get('price'):.3f}",
+                )
+
+        # 2) Try to place new quotes near window open.
+        pending_count = len(self._paper_window_quotes)
+        for m in candidates[:40]:
+            if pending_count >= max_pending * 2:
+                break
+            if not self._is_micro_updown(m):
+                continue
+            if len(open_market_ids) >= max_open_positions:
+                break
+            duration = self._market_window_duration_seconds(m.title or "")
+            if duration <= 0:
+                continue
+            elapsed = duration - int(m.close_time_seconds or 0)
+            if elapsed < 0 or elapsed > open_grace:
+                continue
+            for side in ("YES", "NO"):
+                key = f"{m.id}:{side}"
+                if key in self._paper_window_quotes:
+                    continue
+                self._paper_window_quotes[key] = {
+                    "market_id": m.id,
+                    "market_title": m.title,
+                    "side": side,
+                    "price": bid_price,
+                    "amount": bid_usd,
+                    "created_at": now,
+                    "expires_at": now + cancel_after,
+                }
+                pending_count += 1
+                await self._log(
+                    "INFO",
+                    f"window-edge quote {m.id} {side} @ {bid_price:.3f} for ${bid_usd:.2f} "
+                    f"(expires {cancel_after}s)",
+                )
+
+        # 3) Fill quotes if touched by current market price.
+        # For YES quote, fill when yes_price <= bid. For NO quote, fill when no_price <= bid.
+        for m in candidates[:60]:
+            yes_p = float(getattr(m, "yes_price", 0.0) or 0.0)
+            no_p = float(getattr(m, "no_price", 0.0) or 0.0)
+            for side, live_p in (("YES", yes_p), ("NO", no_p)):
+                key = f"{m.id}:{side}"
+                q = self._paper_window_quotes.get(key)
+                if not q:
+                    continue
+                entry = float(q["price"])
+                amount = float(q["amount"])
+                if live_p > entry:
+                    continue
+                if amount > float(wallet.balance):
+                    await self._log("INFO", f"window-edge skip fill {m.id} {side}: wallet too low")
+                    self._paper_window_quotes.pop(key, None)
+                    continue
+                # Prevent duplicate side entry on same market if already open for that side.
+                existing = (
+                    await s.execute(
+                        select(PolyTrade).where(
+                            PolyTrade.market_id == m.id,
+                            PolyTrade.mode == self.trade_mode,
+                            PolyTrade.status == "OPEN",
+                            PolyTrade.direction == side,
+                        )
+                    )
+                ).scalars().first()
+                if existing:
+                    self._paper_window_quotes.pop(key, None)
+                    continue
+
+                await poly_wallet.debit(s, amount)
+                t = PolyTrade(
+                    market_id=m.id,
+                    market_title=m.title,
+                    direction=side,
+                    amount=amount,
+                    entry_price=entry,
+                    current_price=entry,
+                    status="OPEN",
+                    agent_score=1,
+                    reasoning=f"window_edge_v1 fill side={side} bid={entry:.3f}",
+                    mode=self.trade_mode,
+                )
+                s.add(t)
+                await s.flush()
+                await self._log(
+                    "INFO",
+                    f"window-edge filled {m.id} {side} @ {entry:.3f} (live={live_p:.3f})",
+                )
+                await bus.publish(
+                    "polymarket:trade:opened",
+                    {"id": t.id, "market_id": t.market_id, "direction": t.direction, "entry_price": t.entry_price},
+                )
+                wallet = await poly_wallet.get_wallet(s)
+                await bus.publish("polymarket:wallet:updated", {"balance": wallet.balance})
+                self.trades_today += 1
+                open_market_ids.add(m.id)
+                self._paper_window_quotes.pop(key, None)
+
+    @staticmethod
+    def _market_window_duration_seconds(market_title: str) -> int:
+        low = (market_title or "").lower()
+        if "15m" in low or "15 min" in low:
+            return 15 * 60
+        if "5m" in low or "5 min" in low:
+            return 5 * 60
+        return 0
 
     async def _refresh_winner_wallet_cache(self, poly) -> set[str]:
         now = time.time()
