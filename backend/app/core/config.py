@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
+    TRADINGVIEW_WEBHOOK_SECRET: str = ""
+    TRADINGVIEW_OPENAI_MODEL: str = "gpt-4.1-mini"
 
     KALSHI_KEY_ID: str = ""
     KALSHI_PRIVATE_KEY_PATH: str = "./data/kalshi_key.pem"
@@ -85,12 +87,22 @@ class Settings(BaseSettings):
     POLYMARKET_REQUIRE_LIQUIDITY_SWEEP: bool = True
     POLYMARKET_MIN_CONFIDENCE: float = 0.55
     POLYMARKET_MIN_VOL_RATIO: float = 1.00
+    # Paper-only aggressiveness controls (live flow unchanged).
+    POLYMARKET_PAPER_AGGRESSIVE: bool = True
+    POLYMARKET_PAPER_MAX_OPEN_POSITIONS: int = 20
+    POLYMARKET_PAPER_MIN_CONFIDENCE: float = 0.35
+    POLYMARKET_PAPER_MIN_SCORE: int = 55
+    POLYMARKET_PAPER_MIN_VOL_RATIO: float = 0.10
+    POLYMARKET_PAPER_REQUIRE_LIQUIDITY_SWEEP: bool = False
+    POLYMARKET_PAPER_REQUIRE_HTF_BIAS: bool = False
+    POLYMARKET_PAPER_BYPASS_RISK_ENGINE: bool = True
     # Skip entries where the favorite is weaker than this — markets with the
     # winning side priced below this floor are essentially coin flips and
     # contributed ~67% of full losses in the last 200-trade window.
     POLYMARKET_MIN_FAVORITE_PRICE: float = 0.60
     # MODE-A underdog entry ceiling (was hardcoded at 0.20).
     POLYMARKET_MODE_A_MAX_UNDERDOG_PRICE: float = 0.20
+    POLYMARKET_PAPER_MODE_A_MAX_UNDERDOG_PRICE: float = 0.45
     # 0 = EOA, 1 = POLY_PROXY (Magic email login), 2 = POLY_GNOSIS_SAFE (browser wallet).
     # Browser-wallet accounts (MetaMask etc.) need 2; Magic accounts need 1.
     POLYMARKET_SIGNATURE_TYPE: int = 2
@@ -132,7 +144,7 @@ class Settings(BaseSettings):
     # ── CANDLE BOT (BTC/ETH on Binance) ───────────────────────────────
     # Trades real crypto pairs on Binance Spot using candle strategy:
     # HTF bias → liquidity sweep → BOS → entry on retest → 1:2 RR.
-    CANDLE_LIVE_ENABLED: bool = True
+    CANDLE_LIVE_ENABLED: bool = False
     CANDLE_PAPER_STARTING_BALANCE: float = 1000.00
     CANDLE_SCAN_INTERVAL_SECONDS: int = 15
     # Pairs to trade — comma separated symbols (e.g. "BTCUSDT,ETHUSDT").

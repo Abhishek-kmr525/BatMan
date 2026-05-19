@@ -231,7 +231,11 @@ class PolymarketBot:
             opened_this_tick = 0
             # In live mode cap new opens to 1 per tick to prevent flooding.
             _is_live_tick = _current_mode == "live_armed"
+            _paper_aggressive = (not self.is_live_bot) and bool(getattr(settings, "POLYMARKET_PAPER_AGGRESSIVE", False))
             max_per_tick = 1 if _is_live_tick else max(1, getattr(settings, "POLYMARKET_MAX_OPENS_PER_TICK", 5))
+            max_open_positions = settings.POLYMARKET_MAX_OPEN_POSITIONS if _is_live_tick else int(
+                getattr(settings, "POLYMARKET_PAPER_MAX_OPEN_POSITIONS", settings.POLYMARKET_MAX_OPEN_POSITIONS)
+            )
 
             # Sync paper wallet balance to real CLOB balance so AMTA shows
             # the correct figure instead of a stale paper-simulation number.
@@ -269,7 +273,7 @@ class PolymarketBot:
                                 f"ordered {int(time.time()-_last_sym)}s ago",
                             )
                             continue
-                if len(open_rows) + opened_this_tick >= settings.POLYMARKET_MAX_OPEN_POSITIONS:
+                if len(open_rows) + opened_this_tick >= max_open_positions:
                     break
 
                 # AI + candle + cheatsheet decision.
@@ -283,28 +287,44 @@ class PolymarketBot:
                 if action not in {"BUY_YES", "BUY_NO"}:
                     await self._log("INFO", f"skip {m.id}: AI action {action}")
                     continue
-                if analysis.confidence < float(getattr(settings, "POLYMARKET_MIN_CONFIDENCE", 0.55)):
+                min_conf = float(
+                    getattr(settings, "POLYMARKET_PAPER_MIN_CONFIDENCE", 0.35)
+                    if _paper_aggressive else getattr(settings, "POLYMARKET_MIN_CONFIDENCE", 0.55)
+                )
+                if analysis.confidence < min_conf:
                     await self._log(
                         "INFO",
                         f"skip {m.id}: confidence {analysis.confidence:.2f} < min "
-                        f"{float(getattr(settings, 'POLYMARKET_MIN_CONFIDENCE', 0.55)):.2f}",
+                        f"{min_conf:.2f}",
                     )
                     continue
-                if analysis.score < settings.POLYMARKET_MIN_SCORE:
+                min_score = int(
+                    getattr(settings, "POLYMARKET_PAPER_MIN_SCORE", 55)
+                    if _paper_aggressive else settings.POLYMARKET_MIN_SCORE
+                )
+                if analysis.score < min_score:
                     await self._log(
                         "INFO",
-                        f"skip {m.id}: score {analysis.score} < min {settings.POLYMARKET_MIN_SCORE}",
+                        f"skip {m.id}: score {analysis.score} < min {min_score}",
                     )
                     continue
                 vol_ratio = float((analysis.features or {}).get("vol_ratio", 1.0) or 1.0)
-                if vol_ratio < float(getattr(settings, "POLYMARKET_MIN_VOL_RATIO", 1.0)):
+                min_vol_ratio = float(
+                    getattr(settings, "POLYMARKET_PAPER_MIN_VOL_RATIO", 0.85)
+                    if _paper_aggressive else getattr(settings, "POLYMARKET_MIN_VOL_RATIO", 1.0)
+                )
+                if vol_ratio < min_vol_ratio:
                     await self._log(
                         "INFO",
                         f"skip {m.id}: vol_ratio {vol_ratio:.2f} < min "
-                        f"{float(getattr(settings, 'POLYMARKET_MIN_VOL_RATIO', 1.0)):.2f}",
+                        f"{min_vol_ratio:.2f}",
                     )
                     continue
-                if bool(getattr(settings, "POLYMARKET_REQUIRE_LIQUIDITY_SWEEP", True)):
+                require_sweep = bool(
+                    getattr(settings, "POLYMARKET_PAPER_REQUIRE_LIQUIDITY_SWEEP", False)
+                    if _paper_aggressive else getattr(settings, "POLYMARKET_REQUIRE_LIQUIDITY_SWEEP", True)
+                )
+                if require_sweep:
                     bull_sweep = bool((analysis.features or {}).get("bull_liquidity_sweep"))
                     bear_sweep = bool((analysis.features or {}).get("bear_liquidity_sweep"))
                     if action == "BUY_YES" and not bull_sweep:
@@ -313,7 +333,11 @@ class PolymarketBot:
                     if action == "BUY_NO" and not bear_sweep:
                         await self._log("INFO", f"skip {m.id}: no bearish liquidity sweep")
                         continue
-                if bool(getattr(settings, "POLYMARKET_REQUIRE_HTF_BIAS", True)):
+                require_htf = bool(
+                    getattr(settings, "POLYMARKET_PAPER_REQUIRE_HTF_BIAS", False)
+                    if _paper_aggressive else getattr(settings, "POLYMARKET_REQUIRE_HTF_BIAS", True)
+                )
+                if require_htf:
                     htf_bias = str((analysis.features or {}).get("htf_bias") or "unknown")
                     if action == "BUY_YES" and htf_bias == "down":
                         await self._log("INFO", f"skip {m.id}: HTF bias down vs BUY_YES")
@@ -325,7 +349,7 @@ class PolymarketBot:
                 side = "YES" if action == "BUY_YES" else "NO"
                 entry = m.yes_price if side == "YES" else m.no_price
 
-                if not self.is_live_bot:
+                if not self.is_live_bot and not bool(getattr(settings, "POLYMARKET_PAPER_BYPASS_RISK_ENGINE", True) and _paper_aggressive):
                     await self._log("INFO", f"risk check {m.id}: begin")
                     try:
                         risk = await asyncio.wait_for(
@@ -395,7 +419,10 @@ class PolymarketBot:
                         plan_side = "NO"
                         plan_entry = no_p
 
-                    mode_a_max = float(getattr(settings, "POLYMARKET_MODE_A_MAX_UNDERDOG_PRICE", 0.20))
+                    mode_a_max = float(
+                        getattr(settings, "POLYMARKET_PAPER_MODE_A_MAX_UNDERDOG_PRICE", 0.45)
+                        if _paper_aggressive else getattr(settings, "POLYMARKET_MODE_A_MAX_UNDERDOG_PRICE", 0.20)
+                    )
                     if plan_entry > mode_a_max:
                         await self._log(
                             "INFO",
