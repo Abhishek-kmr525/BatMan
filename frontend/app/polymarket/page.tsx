@@ -56,6 +56,7 @@ export default function PolymarketPaperPage() {
   const [markets, setMarkets] = useState<Market[]>([]);
   const [busy, setBusy] = useState(false);
   const [actionMsg, setActionMsg] = useState<string>("");
+  const [nextWindowSeconds, setNextWindowSeconds] = useState<number | null>(null);
 
   async function refresh() {
     const [b, w, o, c, l, m] = await Promise.all([
@@ -73,11 +74,25 @@ export default function PolymarketPaperPage() {
     const nowIso = new Date().toISOString();
     setLogs((l || []).map((x) => ({ ...x, local_ts: x.ts ?? nowIso })));
     setMarkets(m);
+    const valid = (m || [])
+      .map((row) => Number(row.time_to_close_seconds))
+      .filter((sec) => Number.isFinite(sec) && sec > 0);
+    setNextWindowSeconds(valid.length ? Math.min(...valid) : null);
   }
 
   useEffect(() => {
     void refresh();
     const id = setInterval(() => void refresh(), 4000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      setNextWindowSeconds((prev) => {
+        if (prev == null) return prev;
+        return prev > 0 ? prev - 1 : 0;
+      });
+    }, 1000);
     return () => clearInterval(id);
   }, []);
 
@@ -148,6 +163,13 @@ export default function PolymarketPaperPage() {
     if (wallet?.force_mode_a) return "MODE-A";
     return ((wallet?.trade_balance ?? wallet?.balance ?? 0) >= 5 ? "MODE-B" : "MODE-A");
   }, [wallet?.force_mode_a, wallet?.trade_balance, wallet?.balance]);
+  const nextWindowText = useMemo(() => {
+    if (nextWindowSeconds == null) return "--:--";
+    const total = Math.max(0, Math.floor(nextWindowSeconds));
+    const mm = String(Math.floor(total / 60)).padStart(2, "0");
+    const ss = String(total % 60).padStart(2, "0");
+    return `${mm}:${ss}`;
+  }, [nextWindowSeconds]);
   const running = bot?.status === "running";
   const derivedWins = closedTrades.filter((t) => t.pnl > 0).length;
   const derivedLosses = closedTrades.filter((t) => t.pnl < 0).length;
@@ -298,6 +320,7 @@ export default function PolymarketPaperPage() {
           <div className="operator-kpi"><span>W / L</span><strong style={{ fontSize: 18, whiteSpace: "nowrap" }}><span style={{ color: "#63ffbe", display: "inline" }}>{wins}W</span> / <span style={{ color: "#ff8f9a", display: "inline" }}>{losses}L</span></strong></div>
           <div className="operator-kpi"><span>SCANNED</span><strong>{bot?.scanned_markets_today ?? 0}</strong></div>
           <div className="operator-kpi"><span>CANDIDATES</span><strong>{bot?.last_candidate_count ?? 0}</strong></div>
+          <div className="operator-kpi"><span>NEXT WINDOW</span><strong style={{ color: "#ffcf6b" }}>{nextWindowText}</strong></div>
           <div className="operator-kpi"><span>STRATEGY</span><strong style={{ color: inferredMode === "MODE-B" ? "#ffcf6b" : "#8bc1ff" }}>{inferredMode}</strong></div>
         </div>
 
