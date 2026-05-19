@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import datetime, timezone
 from typing import Literal
@@ -762,6 +763,18 @@ class PolymarketBot:
             return 15 * 60
         if "5m" in low or "5 min" in low:
             return 5 * 60
+        m = re.search(r"(\d{1,2}):(\d{2})(am|pm)\s*-\s*(\d{1,2}):(\d{2})(am|pm)", low)
+        if m:
+            sh, sm, sap, eh, em, eap = m.groups()
+            sh_i = int(sh) % 12 + (12 if sap == "pm" else 0)
+            eh_i = int(eh) % 12 + (12 if eap == "pm" else 0)
+            start_min = sh_i * 60 + int(sm)
+            end_min = eh_i * 60 + int(em)
+            if end_min < start_min:
+                end_min += 24 * 60
+            dur_min = end_min - start_min
+            if dur_min in {5, 15}:
+                return dur_min * 60
         return 0
 
     async def _refresh_winner_wallet_cache(self, poly) -> set[str]:
@@ -804,7 +817,10 @@ class PolymarketBot:
         if not (("up or down" in hay) or ("updown" in hay)):
             return False
         # Focus only on short windows requested by user: 5m / 15m.
-        return any(tok in hay for tok in ("5m", "15m", "5 min", "15 min"))
+        if any(tok in hay for tok in ("5m", "15m", "5 min", "15 min")):
+            return True
+        dur = PolymarketBot._market_window_duration_seconds(m.title or "")
+        return dur in {5 * 60, 15 * 60}
 
     @staticmethod
     def _extract_symbol(market_title: str) -> str:
