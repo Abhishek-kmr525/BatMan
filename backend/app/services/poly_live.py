@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 _client: ClobClient | None = None
 _proxy_installed: bool = False
+_last_balance_error_ts: float | None = None
+_last_balance_error_kind: str = ""
 
 def _hydrate_api_creds(client: ClobClient) -> bool:
     """Ensure client has L2 creds; retry-safe for long-lived singleton client."""
@@ -153,8 +155,11 @@ _last_balance_error: str = ""
 
 async def get_live_balance() -> float:
     """Return live USDC balance, or 0.0 on failure (error stored in get_live_balance_error())."""
-    global _last_balance_error
+    import asyncio
+    global _last_balance_error, _last_balance_error_ts, _last_balance_error_kind
     _last_balance_error = ""
+    _last_balance_error_kind = ""
+    _last_balance_error_ts = None
     client = get_live_client()
     if not client:
         _last_balance_error = "ClobClient not initialised — check POLYMARKET_PRIVATE_KEY"
@@ -162,7 +167,11 @@ async def get_live_balance() -> float:
     # Heal clients that were initialized without creds after transient auth error.
     _hydrate_api_creds(client)
     try:
-        res = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        # Run the blocking SDK call in a thread so it doesn't block the event loop.
+        res = await asyncio.to_thread(
+            client.get_balance_allowance,
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+        )
         # Balance returned as raw USDC atomic units (6 decimals); divide by 1e6.
         raw_bal = float(res.get("balance", 0))
         return raw_bal / 1e6
@@ -179,7 +188,21 @@ async def get_live_balance() -> float:
                     err_msg = str(getattr(e2, "error_msg", getattr(e2, "error_message", str(e2))))
         if hasattr(e, "status_code"):
             err_msg = f"HTTP {e.status_code}: {err_msg}"
+            _last_balance_error_kind = f"http_{getattr(e, 'status_code', 'error')}"
+        else:
+            low = err_msg.lower()
+            if "name or service not known" in low or "nodename nor servname provided" in low:
+                _last_balance_error_kind = "dns"
+            elif "timed out" in low or "timeout" in low:
+                _last_balance_error_kind = "timeout"
+            elif "certificate" in low or "tls" in low or "ssl" in low:
+                _last_balance_error_kind = "tls"
+            elif "connect" in low:
+                _last_balance_error_kind = "connect"
+            else:
+                _last_balance_error_kind = "request"
         _last_balance_error = err_msg
+        _last_balance_error_ts = __import__("time").time()
         logger.error(
             "Failed to fetch live polymarket balance: %s | host=%s proxy=%s",
             err_msg,
@@ -192,6 +215,74 @@ async def get_live_balance() -> float:
 def get_live_balance_error() -> str:
     """Return the last error string from get_live_balance(), or empty string if OK."""
     return _last_balance_error
+
+
+def get_live_balance_error_meta() -> dict:
+    return {
+        "message": _last_balance_error or "",
+        "kind": _last_balance_error_kind or "",
+        "timestamp": _last_balance_error_ts,
+    }
+
+
+async def get_live_preflight(retries: int = 2) -> dict:
+    """Docs-aligned live preflight checks for CLOB trading readiness."""
+    import os
+    host = getattr(settings, "POLYMARKET_HOST", "") or ""
+    sig_type = int(getattr(settings, "POLYMARKET_SIGNATURE_TYPE", 0))
+    funder = (
+        getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
+        or os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
+        or None
+    )
+    api_key = bool((getattr(settings, "POLYMARKET_API_KEY", None) or os.getenv("POLYMARKET_API_KEY", "")).strip())
+    api_secret = bool((getattr(settings, "POLYMARKET_API_SECRET", None) or os.getenv("POLYMARKET_API_SECRET", "")).strip())
+    api_pass = bool((getattr(settings, "POLYMARKET_API_PASSPHRASE", None) or os.getenv("POLYMARKET_API_PASSPHRASE", "")).strip())
+
+    clob_reachable = False
+    clob_status: int | None = None
+    clob_error = ""
+    for _ in range(max(1, retries)):
+        try:
+            async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as c:
+                r = await c.get(host)
+                clob_status = r.status_code
+                clob_reachable = True
+                break
+        except Exception as e:
+            clob_error = str(e)
+            await __import__("asyncio").sleep(0.35)
+
+    client = get_live_client()
+    client_ready = client is not None
+    creds_ready = False
+    if client is not None:
+        creds_ready = _hydrate_api_creds(client)
+
+    balance = await get_live_balance()
+    err = get_live_balance_error()
+    err_meta = get_live_balance_error_meta()
+    balance_ok = (not err) and balance >= 0
+
+    checks = {
+        "clob_reachable": {"ok": clob_reachable, "status_code": clob_status, "error": clob_error or None},
+        "auth_model": {"ok": client_ready, "l1_signer_present": bool(settings.POLYMARKET_PRIVATE_KEY), "l2_creds_ready": bool(creds_ready)},
+        "funder_pairing": {"ok": bool(funder), "funder": funder, "signature_type": sig_type},
+        "api_creds_status": {"ok": api_key and api_secret and api_pass, "api_key": api_key, "api_secret": api_secret, "api_passphrase": api_pass},
+        "balance_fetch": {"ok": balance_ok, "balance": balance if balance_ok else None, "error": err or None, "error_kind": err_meta.get("kind"), "error_ts": err_meta.get("timestamp")},
+    }
+    allow_start = all(v.get("ok", False) for v in checks.values())
+    return {
+        "ok": allow_start,
+        "host": host,
+        "checks": checks,
+        "resolved": {
+            "funder": funder,
+            "signature_type": sig_type,
+            "client_ready": client_ready,
+            "proxy_configured": bool(getattr(settings, "POLYMARKET_PROXY_URL", "")),
+        },
+    }
 
 async def place_live_order(token_id: str, price: float, size: float, side: str) -> dict:
     """

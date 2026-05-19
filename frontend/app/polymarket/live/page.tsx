@@ -26,6 +26,7 @@ type Wallet = {
   last_withdraw_at?: string | null;
   withdrawn_total?: number;
   auto_withdraw_enabled?: boolean;
+  live_funded?: boolean;
   live_error?: string | null;
   total_pnl: number;
   wins: number;
@@ -45,6 +46,18 @@ type WithdrawJob = {
   attempts: number;
   requested_by: string;
   created_at?: string | null;
+};
+type Preflight = {
+  ok: boolean;
+  host: string;
+  checks: {
+    clob_reachable: { ok: boolean; status_code?: number | null; error?: string | null };
+    auth_model: { ok: boolean; l1_signer_present: boolean; l2_creds_ready: boolean };
+    funder_pairing: { ok: boolean; funder?: string | null; signature_type: number };
+    api_creds_status: { ok: boolean; api_key: boolean; api_secret: boolean; api_passphrase: boolean };
+    balance_fetch: { ok: boolean; balance?: number | null; error?: string | null; error_kind?: string | null; error_ts?: number | null };
+  };
+  resolved: { funder?: string | null; signature_type: number; client_ready: boolean; proxy_configured: boolean };
 };
 
 function parseTradeTime(raw?: string | null): number {
@@ -72,11 +85,12 @@ export default function PolymarketLivePage() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [markets, setMarkets] = useState<Market[]>([]);
   const [withdrawJobs, setWithdrawJobs] = useState<WithdrawJob[]>([]);
+  const [preflight, setPreflight] = useState<Preflight | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionMsg, setActionMsg] = useState("");
 
   async function refresh() {
-    const [m, b, w, o, c, l, mk, jobs] = await Promise.all([
+    const [m, b, w, o, c, l, mk, jobs, pf] = await Promise.all([
       api<ModeSnapshot>("/mode/status"),
       api<BotStatus>("/polymarket/live/bot/status"),
       api<Wallet>("/polymarket/live/wallet"),
@@ -85,6 +99,7 @@ export default function PolymarketLivePage() {
       api<LogEntry[]>("/polymarket/logs?mode=live&limit=300"),
       api<Market[]>("/polymarket/markets?limit=10"),
       api<WithdrawJob[]>("/polymarket/live/vault/withdraw-jobs?limit=20"),
+      api<Preflight>("/polymarket/live/preflight"),
     ]);
     setMode(m.polymarket);
     setBot(b);
@@ -114,6 +129,7 @@ export default function PolymarketLivePage() {
     }
     setMarkets(mk);
     setWithdrawJobs(jobs);
+    setPreflight(pf);
   }
 
   useEffect(() => {
@@ -123,6 +139,10 @@ export default function PolymarketLivePage() {
   }, []);
 
   async function start() {
+    if (!preflight?.ok) {
+      setActionMsg("Live preflight failed. Fix connectivity/auth first.");
+      return;
+    }
     setBusy(true);
     try {
       await api("/polymarket/live/bot/start", { method: "POST" });
@@ -203,6 +223,14 @@ export default function PolymarketLivePage() {
     return (liveTradeBalance >= 5 ? "MODE-B" : "MODE-A");
   }, [wallet?.force_mode_a, liveTradeBalance]);
   const running = bot?.status === "running";
+  const sigTypeMap: Record<number, string> = {
+    0: "EOA wallet signing",
+    1: "POLY_PROXY (email/proxy wallet)",
+    2: "POLY_GNOSIS_SAFE (browser wallet/safe)",
+    3: "POLY_BROWSER_WALLET",
+  };
+  const liveFunded = Boolean(wallet?.live_funded);
+  const liveUnfunded = !liveFunded;
   const wins = wallet?.wins ?? 0;
   const losses = wallet?.losses ?? 0;
   const winRate = wins + losses > 0 ? (wins / (wins + losses)) * 100 : wallet?.win_rate ?? 0;
@@ -293,10 +321,15 @@ export default function PolymarketLivePage() {
               <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: running ? "#63ffbe" : "#60708f", marginRight: 2, boxShadow: running ? "0 0 10px #63ffbe" : "none" }} />
               {running ? "ENGINE RUNNING" : "ENGINE IDLE"} · {modeLabel}
             </div>
+            <div style={{ marginTop: 6, fontSize: 12, display: "flex", alignItems: "center", gap: 8, color: liveFunded ? "#63ffbe" : "#ff8f9a" }}>
+              <strong>{liveFunded ? "LIVE FUNDED" : "LIVE UNFUNDED"}</strong>
+              {liveUnfunded && <span style={{ color: "#b8c5de" }}>No live spendable balance. Bot will not open live trades.</span>}
+            </div>
+            {wallet?.live_error && <div style={{ marginTop: 4, fontSize: 12, color: "#ff8f9a" }}>Live wallet error: {wallet.live_error}</div>}
             {actionMsg && <div style={{ marginTop: 4, fontSize: 12, color: "#8bc1ff" }}>{actionMsg}</div>}
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
-            <button className="btn btn-start" disabled={busy || running} onClick={start}>Start</button>
+            <button className="btn btn-start" disabled={busy || running || !preflight?.ok} onClick={start}>Start</button>
             <button className="btn btn-stop" disabled={busy || !running} onClick={stop}>Stop</button>
             <button className="btn btn-secondary" disabled={busy} onClick={refresh}>Refresh</button>
             <button className="btn btn-stop" disabled={busy} onClick={killToggle}>{mode?.kill_switch ? "Disable Kill" : "Enable Kill"}</button>
@@ -316,6 +349,7 @@ export default function PolymarketLivePage() {
           <div className="operator-kpi"><span>CANDIDATES</span><strong>{bot?.last_candidate_count ?? 0}</strong></div>
           <div className="operator-kpi"><span>STRATEGY</span><strong style={{ color: strategy === "MODE-B" ? "#ffcf6b" : "#8bc1ff" }}>{strategy}</strong></div>
           <div className="operator-kpi"><span>KILL SWITCH</span><strong style={{ color: mode?.kill_switch ? "#ff8f9a" : "#63ffbe" }}>{mode?.kill_switch ? "ON" : "OFF"}</strong></div>
+          <div className="operator-kpi"><span>LIVE FUNDING</span><strong style={{ color: liveFunded ? "#63ffbe" : "#ff8f9a" }}>{liveFunded ? "FUNDED" : "UNFUNDED"}</strong></div>
         </div>
 
         <div className="operator-grid" style={{ marginTop: 10 }}>
@@ -416,9 +450,26 @@ export default function PolymarketLivePage() {
               <div className="operator-kv"><span>Live Enabled (config)</span><strong>{mode?.live_enabled ? "yes" : "no"}</strong></div>
               <div className="operator-kv"><span>Kill Switch</span><strong>{mode?.kill_switch ? "ON" : "off"}</strong></div>
               <div className="operator-kv"><span>Bot</span><strong>{bot?.status ?? "—"}</strong></div>
+              <div className="operator-kv"><span>Preflight</span><strong style={{ color: preflight?.ok ? "#63ffbe" : "#ff8f9a" }}>{preflight?.ok ? "PASS" : "FAIL"}</strong></div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8, marginTop: 10 }}>
                 <button className="btn btn-stop" disabled={busy} onClick={killToggle}>{mode?.kill_switch ? "Disable Kill" : "Enable Kill"}</button>
               </div>
+            </div>
+            <div className="card">
+              <h3>LIVE CONNECTIVITY</h3>
+              <div className="operator-kv"><span>CLOB Host</span><strong style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis" }}>{preflight?.host ?? "—"}</strong></div>
+              <div className="operator-kv"><span>CLOB Reachable</span><strong style={{ color: preflight?.checks?.clob_reachable?.ok ? "#63ffbe" : "#ff8f9a" }}>{preflight?.checks?.clob_reachable?.ok ? "YES" : "NO"}</strong></div>
+              <div className="operator-kv"><span>Auth (L1+L2)</span><strong style={{ color: preflight?.checks?.auth_model?.ok ? "#63ffbe" : "#ff8f9a" }}>{preflight?.checks?.auth_model?.ok ? "OK" : "FAIL"}</strong></div>
+              <div className="operator-kv"><span>Funder</span><strong style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis" }}>{preflight?.resolved?.funder ?? "—"}</strong></div>
+              <div className="operator-kv"><span>Signature Type</span><strong>{preflight?.resolved?.signature_type ?? 0} · {sigTypeMap[preflight?.resolved?.signature_type ?? 0] ?? "Unknown"}</strong></div>
+              <div className="operator-kv"><span>API Creds</span><strong style={{ color: preflight?.checks?.api_creds_status?.ok ? "#63ffbe" : "#ffcf6b" }}>{preflight?.checks?.api_creds_status?.ok ? "SET" : "DERIVE/FALLBACK"}</strong></div>
+              <div className="operator-kv"><span>Balance Fetch</span><strong style={{ color: preflight?.checks?.balance_fetch?.ok ? "#63ffbe" : "#ff8f9a" }}>{preflight?.checks?.balance_fetch?.ok ? `$${(preflight?.checks?.balance_fetch?.balance ?? 0).toFixed(4)}` : "UNKNOWN (failed)"}</strong></div>
+              {!preflight?.checks?.balance_fetch?.ok && (
+                <div style={{ marginTop: 6, fontSize: 12, color: "#ff8f9a", lineHeight: 1.4 }}>
+                  {preflight?.checks?.balance_fetch?.error_kind ? `Error kind: ${preflight.checks.balance_fetch.error_kind}. ` : ""}
+                  {preflight?.checks?.balance_fetch?.error ?? "Balance fetch failed."}
+                </div>
+              )}
             </div>
             <div className="card">
               <h3>LIVE VAULT</h3>

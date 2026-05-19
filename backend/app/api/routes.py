@@ -33,7 +33,7 @@ from app.services.intel import gather_market_intel
 from app.services.kalshi import get_kalshi
 from app.services.kalshi import Market
 from app.services.mode_guard import mode_guard
-from app.services.poly_live import get_live_balance, get_live_balance_error
+from app.services.poly_live import get_live_balance, get_live_balance_error, get_live_preflight
 from app.services.poly_live_vault import (
     compute_auto_withdraw_eligibility,
     execute_withdraw_job,
@@ -659,7 +659,17 @@ async def polymarket_paper_bot_status(session: AsyncSession = Depends(get_sessio
 
 
 @router.post("/polymarket/live/bot/start")
-async def polymarket_live_bot_start():
+async def polymarket_live_bot_start(session: AsyncSession = Depends(get_session)):
+    preflight = await get_live_preflight(retries=2)
+    if not preflight.get("ok"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "live preflight failed",
+                "preflight": preflight,
+            },
+        )
+
     await poly_live_bot.start()
     return poly_live_bot.status()
 
@@ -853,6 +863,7 @@ async def _polymarket_wallet_by_mode(current_mode: str, session: AsyncSession) -
         "win_rate": round(win_rate, 2),
     }
     if is_live:
+        live_funded = (live_trade_balance > 0.0) if bool(settings.POLY_LIVE_VAULT_ENABLED) else (live_actual_balance > 0.0)
         return {
             **common,
             "trade_balance": round(live_trade_balance, 4),
@@ -865,6 +876,7 @@ async def _polymarket_wallet_by_mode(current_mode: str, session: AsyncSession) -
             "last_withdraw_at": (w.live_last_withdraw_at.isoformat() if w.live_last_withdraw_at else None),
             "withdrawn_total": round(float(w.live_withdrawn_total or 0.0), 4),
             "vault_enabled": bool(settings.POLY_LIVE_VAULT_ENABLED),
+            "live_funded": bool(live_funded),
             "auto_withdraw_enabled": bool(_poly_live_auto_withdraw_enabled()),
             "live_error": live_error,
         }
@@ -1069,19 +1081,12 @@ async def polymarket_live_trade_delete(body: PolyLiveTradeDeleteBody, session: A
 @router.get("/polymarket/live/health")
 async def polymarket_live_health():
     """Quick connectivity check for the live CLOB client."""
-    from app.services.poly_live import get_live_client, get_live_balance_error
-    client = get_live_client()
-    if client is None:
-        return {"ok": False, "error": "ClobClient not initialised — check POLYMARKET_PRIVATE_KEY"}
-    balance = await get_live_balance()
-    err = get_live_balance_error()
-    return {
-        "ok": not bool(err),
-        "balance": balance,
-        "error": err or None,
-        "funder": getattr(getattr(client, "builder", None), "funder", None),
-        "sig_type": getattr(getattr(client, "builder", None), "signature_type", None),
-    }
+    return await get_live_preflight(retries=2)
+
+
+@router.get("/polymarket/live/preflight")
+async def polymarket_live_preflight():
+    return await get_live_preflight(retries=2)
 
 
 @router.get("/polymarket/trades")
