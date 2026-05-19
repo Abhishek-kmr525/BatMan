@@ -94,6 +94,60 @@ class PolymarketClient:
         except Exception:
             return _mock_markets(limit)
 
+    async def get_wallet_recent_activity(
+        self,
+        wallet: str,
+        *,
+        limit: int = 100,
+        lookback_hours: int = 24,
+    ) -> dict[str, Any]:
+        """Fetch recent activity for a wallet from data-api and summarize conditionIds.
+
+        Returns:
+          {
+            "ok": bool,
+            "count": int,
+            "condition_ids": set[str],
+            "latest_ts": int | None,
+            "rows": list[dict]
+          }
+        """
+        w = (wallet or "").strip().lower()
+        if not w:
+            return {"ok": False, "count": 0, "condition_ids": set(), "latest_ts": None, "rows": []}
+        try:
+            res = await self._http.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": w, "limit": max(1, min(int(limit), 500))},
+            )
+            res.raise_for_status()
+            rows = res.json() if isinstance(res.json(), list) else []
+            cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=max(1, lookback_hours))).timestamp())
+            out_rows: list[dict[str, Any]] = []
+            condition_ids: set[str] = set()
+            latest_ts: int | None = None
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                ts = int(r.get("timestamp") or 0)
+                if ts and ts < cutoff_ts:
+                    continue
+                cond = str(r.get("conditionId") or "").strip()
+                if cond:
+                    condition_ids.add(cond)
+                if ts:
+                    latest_ts = max(latest_ts or ts, ts)
+                out_rows.append(r)
+            return {
+                "ok": True,
+                "count": len(out_rows),
+                "condition_ids": condition_ids,
+                "latest_ts": latest_ts,
+                "rows": out_rows,
+            }
+        except Exception:
+            return {"ok": False, "count": 0, "condition_ids": set(), "latest_ts": None, "rows": []}
+
 
 def _parse_market(row: dict[str, Any]) -> PolyMarket | None:
     title = str(row.get("question") or row.get("title") or "").strip()

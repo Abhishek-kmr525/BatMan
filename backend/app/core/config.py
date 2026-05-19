@@ -103,6 +103,13 @@ class Settings(BaseSettings):
     # MODE-A underdog entry ceiling (was hardcoded at 0.20).
     POLYMARKET_MODE_A_MAX_UNDERDOG_PRICE: float = 0.20
     POLYMARKET_PAPER_MODE_A_MAX_UNDERDOG_PRICE: float = 0.45
+    # Optional "winner wallet" tracker for paper bot candidate prioritization.
+    POLYMARKET_WINNER_WALLET_ENABLED: bool = True
+    POLYMARKET_WINNER_WALLET: str = "0x1887879a1bda615e88f280b582514c7d54e2678a"
+    POLYMARKET_WINNER_WALLET_LOOKBACK_HOURS: int = 24
+    POLYMARKET_WINNER_WALLET_LIMIT: int = 150
+    POLYMARKET_WINNER_WALLET_REFRESH_SECONDS: int = 45
+    POLYMARKET_WINNER_WALLET_ONLY: bool = False
     # 0 = EOA, 1 = POLY_PROXY (Magic email login), 2 = POLY_GNOSIS_SAFE (browser wallet).
     # Browser-wallet accounts (MetaMask etc.) need 2; Magic accounts need 1.
     POLYMARKET_SIGNATURE_TYPE: int = 2

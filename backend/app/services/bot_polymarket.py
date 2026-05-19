@@ -52,6 +52,11 @@ class PolymarketBot:
         # Per-symbol cooldown (asset name → epoch seconds).
         # Prevents repeatedly buying consecutive 5-min windows for same asset.
         self._recently_ordered_symbols: dict[str, float] = {}
+        # Winner-wallet activity cache (paper bot only).
+        self._winner_condition_ids: set[str] = set()
+        self._winner_last_sync_ts: float | None = None
+        self._winner_last_activity_ts: int | None = None
+        self._winner_last_count: int = 0
 
     @property
     def running(self) -> bool:
@@ -96,6 +101,14 @@ class PolymarketBot:
             "scanned_markets_today": self.scanned_markets_today,
             "last_scan_count": self.last_scan_count,
             "last_candidate_count": self.last_candidate_count,
+            "winner_wallet": {
+                "enabled": bool(settings.POLYMARKET_WINNER_WALLET_ENABLED),
+                "address": settings.POLYMARKET_WINNER_WALLET,
+                "tracked_conditions": len(self._winner_condition_ids),
+                "recent_activity_count": self._winner_last_count,
+                "last_activity_ts": self._winner_last_activity_ts,
+                "last_sync_ts": self._winner_last_sync_ts,
+            },
             "started_at": self.started_at.isoformat() if self.started_at else None,
         }
 
@@ -166,7 +179,36 @@ class PolymarketBot:
         if not candidates:
             return
 
-        candidates.sort(key=lambda m: m.volume, reverse=True)
+        # Paper-only winner-wallet tracking and candidate prioritization/filtering.
+        winner_matches: set[str] = set()
+        if (
+            (not self.is_live_bot)
+            and bool(settings.POLYMARKET_WINNER_WALLET_ENABLED)
+            and (settings.POLYMARKET_WINNER_WALLET or "").strip()
+        ):
+            winner_matches = await self._refresh_winner_wallet_cache(poly)
+            if winner_matches:
+                # Sort with winner-wallet matched markets first, then by volume.
+                candidates.sort(
+                    key=lambda m: ((m.raw or {}).get("conditionId") not in winner_matches, -m.volume)
+                )
+                await self._log(
+                    "INFO",
+                    f"winner wallet priority: {len(winner_matches)} matching conditionIds in this cycle",
+                )
+            if bool(settings.POLYMARKET_WINNER_WALLET_ONLY):
+                candidates = [
+                    m
+                    for m in candidates
+                    if str((m.raw or {}).get("conditionId") or "") in winner_matches
+                ]
+                self.last_candidate_count = len(candidates)
+                if not candidates:
+                    await self._log("INFO", "winner wallet only mode: no matching candidates this tick")
+                    return
+
+        if not winner_matches:
+            candidates.sort(key=lambda m: m.volume, reverse=True)
         self.state = "ANALYZING"
         await self._log("INFO", f"polymarket tick: scanned={len(markets)} candidates={len(candidates)}")
         async with SessionLocal() as s:
@@ -245,6 +287,9 @@ class PolymarketBot:
             for m in candidates[:25]:
                 title_short = " ".join((m.title or "").split())
                 title_short = f"{title_short[:88]}…" if len(title_short) > 88 else title_short
+                cond_id = str((m.raw or {}).get("conditionId") or "")
+                if cond_id and cond_id in winner_matches:
+                    await self._log("INFO", f"winner wallet match {m.id}: conditionId {cond_id}")
                 await self._log(
                     "INFO",
                     f"scan {m.id} | {title_short} | YES {m.yes_price:.3f} / NO {m.no_price:.3f}",
@@ -572,6 +617,37 @@ class PolymarketBot:
                 wallet = await poly_wallet.get_wallet(s)
                 if opened_this_tick >= max_per_tick:
                     break
+
+    async def _refresh_winner_wallet_cache(self, poly) -> set[str]:
+        now = time.time()
+        refresh_every = max(10, int(settings.POLYMARKET_WINNER_WALLET_REFRESH_SECONDS))
+        if (
+            self._winner_last_sync_ts is not None
+            and (now - self._winner_last_sync_ts) < refresh_every
+        ):
+            return self._winner_condition_ids
+        wallet_addr = (settings.POLYMARKET_WINNER_WALLET or "").strip()
+        try:
+            data = await poly.get_wallet_recent_activity(
+                wallet_addr,
+                limit=max(1, int(settings.POLYMARKET_WINNER_WALLET_LIMIT)),
+                lookback_hours=max(1, int(settings.POLYMARKET_WINNER_WALLET_LOOKBACK_HOURS)),
+            )
+            if bool(data.get("ok")):
+                self._winner_condition_ids = set(data.get("condition_ids") or set())
+                self._winner_last_count = int(data.get("count") or 0)
+                self._winner_last_activity_ts = data.get("latest_ts")
+                self._winner_last_sync_ts = now
+                await self._log(
+                    "INFO",
+                    f"winner wallet sync ok: conditions={len(self._winner_condition_ids)} "
+                    f"activity={self._winner_last_count}",
+                )
+            else:
+                await self._log("INFO", "winner wallet sync: no data")
+        except Exception as e:
+            await self._log("ERROR", f"winner wallet sync failed: {e}")
+        return self._winner_condition_ids
 
     @staticmethod
     def _is_micro_updown(m) -> bool:
