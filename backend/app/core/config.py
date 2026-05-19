@@ -98,14 +98,25 @@ class Settings(BaseSettings):
     POLYMARKET_PAPER_BYPASS_RISK_ENGINE: bool = True
     # Strategy selector:
     # - sweep_ai_v1: existing AI+sweep flow
-    # - window_edge_v1: video-style low-bid window-edge quoting (paper-first)
-    POLYMARKET_STRATEGY: str = "window_edge_v1"
-    # Window-edge strategy params (paper-first).
+    # - window_edge_v1: legacy window-edge profile
+    # - mode_d_window_edge_v1: strict Mode D profile (live + paper)
+    POLYMARKET_STRATEGY: str = "mode_d_window_edge_v1"
+    # Window-edge strategy params.
     POLYMARKET_WINDOW_EDGE_BID_PRICE: float = 0.02
     POLYMARKET_WINDOW_EDGE_BID_USD_PER_SIDE: float = 1.00
-    POLYMARKET_WINDOW_EDGE_OPEN_GRACE_SECONDS: int = 120
+    # Place only in first few seconds of a newly opened 5m/15m window.
+    POLYMARKET_WINDOW_EDGE_OPEN_GRACE_SECONDS: int = 3
+    # Keep resting orders for at most this many seconds, then cancel.
     POLYMARKET_WINDOW_EDGE_CANCEL_AFTER_SECONDS: int = 120
-    POLYMARKET_WINDOW_EDGE_MAX_PENDING_PER_SIDE: int = 8
+    # Max concurrent resting quotes per side (YES / NO).
+    POLYMARKET_WINDOW_EDGE_MAX_PENDING_PER_SIDE: int = 5
+    # Optional settlement-delay mode: place both-side bids near close where
+    # stale book states are occasionally observed.
+    POLYMARKET_WINDOW_EDGE_SETTLEMENT_ENABLED: bool = True
+    POLYMARKET_WINDOW_EDGE_SETTLEMENT_CLOSE_SECONDS: int = 3
+    POLYMARKET_WINDOW_EDGE_SETTLEMENT_CANCEL_AFTER_SECONDS: int = 12
+    # Restrict Mode D universe to these assets.
+    POLYMARKET_WINDOW_EDGE_ALLOWED_ASSETS: str = "BTC,ETH,SOL,XRP"
     # Skip entries where the favorite is weaker than this — markets with the
     # winning side priced below this floor are essentially coin flips and
     # contributed ~67% of full losses in the last 200-trade window.

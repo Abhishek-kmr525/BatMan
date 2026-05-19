@@ -293,7 +293,7 @@ class PolymarketBot:
                 wallet.balance = round(_live_clob_balance, 4)
 
             strategy = (getattr(settings, "POLYMARKET_STRATEGY", "sweep_ai_v1") or "sweep_ai_v1").strip().lower()
-            if strategy == "window_edge_v1":
+            if strategy in {"window_edge_v1", "mode_d_window_edge_v1"}:
                 if self.is_live_bot:
                     await self._run_window_edge_live(
                         s=s,
@@ -658,6 +658,10 @@ class PolymarketBot:
         open_grace = max(10, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_OPEN_GRACE_SECONDS", 120)))
         cancel_after = max(10, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_CANCEL_AFTER_SECONDS", 120)))
         max_pending = max(1, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_MAX_PENDING_PER_SIDE", 8)))
+        settlement_enabled = bool(getattr(settings, "POLYMARKET_WINDOW_EDGE_SETTLEMENT_ENABLED", True))
+        settlement_close = max(1, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_SETTLEMENT_CLOSE_SECONDS", 3)))
+        settlement_cancel_after = max(3, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_SETTLEMENT_CANCEL_AFTER_SECONDS", 12)))
+        allowed_assets = self._allowed_mode_d_assets()
         now = time.time()
 
         # 1) Expire old quotes.
@@ -677,14 +681,24 @@ class PolymarketBot:
                 break
             if not self._is_micro_updown(m):
                 continue
+            sym = self._extract_symbol(m.title or "").upper()
+            if allowed_assets and sym not in allowed_assets:
+                continue
             if len(open_market_ids) >= max_open_positions:
                 break
             duration = self._market_window_duration_seconds(m.title or "")
             if duration <= 0:
                 continue
             elapsed = duration - int(m.close_time_seconds or 0)
-            if elapsed < 0 or elapsed > open_grace:
+            place_open = 0 <= elapsed <= open_grace
+            place_settlement = (
+                settlement_enabled
+                and int(m.close_time_seconds or 0) <= settlement_close
+                and int(m.close_time_seconds or 0) > 0
+            )
+            if not (place_open or place_settlement):
                 continue
+            exp_secs = settlement_cancel_after if place_settlement else cancel_after
             for side in ("YES", "NO"):
                 key = f"{m.id}:{side}"
                 if key in self._paper_window_quotes:
@@ -696,13 +710,13 @@ class PolymarketBot:
                     "price": bid_price,
                     "amount": bid_usd,
                     "created_at": now,
-                    "expires_at": now + cancel_after,
+                    "expires_at": now + exp_secs,
                 }
                 pending_count += 1
                 await self._log(
                     "INFO",
                     f"window-edge quote {m.id} {side} @ {bid_price:.3f} for ${bid_usd:.2f} "
-                    f"(expires {cancel_after}s)",
+                    f"(expires {exp_secs}s, phase={'settlement' if place_settlement else 'open'})",
                 )
 
         # 3) Fill quotes if touched by current market price.
@@ -773,6 +787,10 @@ class PolymarketBot:
         open_grace = max(10, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_OPEN_GRACE_SECONDS", 120)))
         cancel_after = max(10, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_CANCEL_AFTER_SECONDS", 120)))
         max_pending = max(1, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_MAX_PENDING_PER_SIDE", 8)))
+        settlement_enabled = bool(getattr(settings, "POLYMARKET_WINDOW_EDGE_SETTLEMENT_ENABLED", True))
+        settlement_close = max(1, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_SETTLEMENT_CLOSE_SECONDS", 3)))
+        settlement_cancel_after = max(3, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_SETTLEMENT_CANCEL_AFTER_SECONDS", 12)))
+        allowed_assets = self._allowed_mode_d_assets()
         now = time.time()
 
         # 1) Cancel expired live resting orders.
@@ -796,14 +814,24 @@ class PolymarketBot:
                 break
             if not self._is_micro_updown(m):
                 continue
+            sym = self._extract_symbol(m.title or "").upper()
+            if allowed_assets and sym not in allowed_assets:
+                continue
             if len(open_market_ids) >= max_open_positions:
                 break
             duration = self._market_window_duration_seconds(m.title or "")
             if duration <= 0:
                 continue
             elapsed = duration - int(m.close_time_seconds or 0)
-            if elapsed < 0 or elapsed > open_grace:
+            place_open = 0 <= elapsed <= open_grace
+            place_settlement = (
+                settlement_enabled
+                and int(m.close_time_seconds or 0) <= settlement_close
+                and int(m.close_time_seconds or 0) > 0
+            )
+            if not (place_open or place_settlement):
                 continue
+            exp_secs = settlement_cancel_after if place_settlement else cancel_after
 
             raw_tokens = (m.raw or {}).get("clobTokenIds")
             if isinstance(raw_tokens, str):
@@ -852,13 +880,13 @@ class PolymarketBot:
                     "price": bid_price,
                     "amount": bid_usd,
                     "created_at": now,
-                    "expires_at": now + cancel_after,
+                    "expires_at": now + exp_secs,
                 }
                 pending_count += 1
                 await self._log(
                     "INFO",
                     f"window-edge LIVE quote {m.id} {side} @ {bid_price:.3f} "
-                    f"${bid_usd:.2f} order={oid}",
+                    f"${bid_usd:.2f} order={oid} (expires {exp_secs}s, phase={'settlement' if place_settlement else 'open'})",
                 )
 
     @staticmethod
@@ -881,6 +909,27 @@ class PolymarketBot:
             if dur_min in {5, 15}:
                 return dur_min * 60
         return 0
+
+    @staticmethod
+    def _allowed_mode_d_assets() -> set[str]:
+        raw = str(getattr(settings, "POLYMARKET_WINDOW_EDGE_ALLOWED_ASSETS", "") or "")
+        if not raw.strip():
+            return set()
+        items = [x.strip().upper() for x in raw.split(",") if x.strip()]
+        # normalize common title forms
+        norm: set[str] = set()
+        for x in items:
+            if x in {"BITCOIN", "BTC"}:
+                norm.add("BTC")
+            elif x in {"ETHEREUM", "ETH"}:
+                norm.add("ETH")
+            elif x in {"SOLANA", "SOL"}:
+                norm.add("SOL")
+            elif x in {"XRP"}:
+                norm.add("XRP")
+            else:
+                norm.add(x)
+        return norm
 
     async def _refresh_winner_wallet_cache(self, poly) -> set[str]:
         now = time.time()
@@ -940,10 +989,30 @@ class PolymarketBot:
         low = title.lower()
         idx = low.find(" up or down")
         if idx > 0:
-            return title[:idx].strip().lower()
+            sym = title[:idx].strip().lower()
+            if sym == "bitcoin":
+                return "BTC"
+            if sym == "ethereum":
+                return "ETH"
+            if sym == "solana":
+                return "SOL"
+            if sym == "xrp":
+                return "XRP"
+            return sym.upper()
         # Fallback: first word
         parts = title.split()
-        return parts[0].lower() if parts else ""
+        if not parts:
+            return ""
+        p = parts[0].strip().lower()
+        if p == "bitcoin":
+            return "BTC"
+        if p == "ethereum":
+            return "ETH"
+        if p == "solana":
+            return "SOL"
+        if p == "xrp":
+            return "XRP"
+        return p.upper()
 
     async def _manage_positions(self, s, poly) -> None:
         open_rows = (
