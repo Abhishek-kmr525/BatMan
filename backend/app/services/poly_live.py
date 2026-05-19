@@ -370,6 +370,30 @@ async def place_live_order(token_id: str, price: float, size: float, side: str) 
         return {"ok": False, "error": err_msg}
 
 
+async def cancel_live_order(order_id: str) -> dict:
+    """Best-effort order cancel for resting live orders."""
+    import asyncio
+    client = get_live_client()
+    if not client:
+        return {"ok": False, "error": "live client not initialized"}
+    _hydrate_api_creds(client)
+    try:
+        # SDK method names differ across releases; try common variants.
+        for method in ("cancel", "cancel_order"):
+            fn = getattr(client, method, None)
+            if fn is None:
+                continue
+            res = await asyncio.to_thread(fn, order_id)
+            if isinstance(res, dict):
+                if res.get("success", True):
+                    return {"ok": True, "result": res}
+                return {"ok": False, "error": str(res.get("errorMsg") or res)}
+            return {"ok": True, "result": res}
+        return {"ok": False, "error": "cancel method not available in client"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 async def perform_live_withdraw(amount_usd: float, idempotency_key: str) -> tuple[bool, str | None, str | None]:
     """Best-effort live withdraw adapter.
 

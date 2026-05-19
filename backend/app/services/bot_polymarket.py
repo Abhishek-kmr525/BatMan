@@ -20,7 +20,7 @@ from app.services.canary_guard import check_polymarket_canary
 from app.services.polymarket import get_polymarket
 from app.services import poly_wallet
 from app.services.poly_analyzer import analyze_polymarket
-from app.services.poly_live import place_live_order
+from app.services.poly_live import place_live_order, cancel_live_order
 from app.services.poly_live_vault import sweep_live_excess_if_needed
 from app.services.poly_live_vault import compute_auto_withdraw_eligibility, execute_withdraw_job, request_withdraw_job
 from app.services.risk_engine import check_polymarket_entry_risk
@@ -62,6 +62,9 @@ class PolymarketBot:
         # Paper-only virtual resting quotes for window-edge strategy.
         # key: "{market_id}:{YES|NO}" -> {side, market_id, price, amount, expires_at, created_at}
         self._paper_window_quotes: dict[str, dict] = {}
+        # Live resting orders for window-edge strategy.
+        # key: "{market_id}:{YES|NO}" -> {order_id, token_id, ...}
+        self._live_window_orders: dict[str, dict] = {}
 
     @property
     def running(self) -> bool:
@@ -290,14 +293,22 @@ class PolymarketBot:
                 wallet.balance = round(_live_clob_balance, 4)
 
             strategy = (getattr(settings, "POLYMARKET_STRATEGY", "sweep_ai_v1") or "sweep_ai_v1").strip().lower()
-            if strategy == "window_edge_v1" and not self.is_live_bot:
-                await self._run_window_edge_paper(
+            if strategy == "window_edge_v1":
+                if self.is_live_bot:
+                    await self._run_window_edge_live(
+                        s=s,
+                        candidates=candidates,
+                        open_market_ids=open_market_ids,
+                        max_open_positions=max_open_positions,
+                    )
+                else:
+                    await self._run_window_edge_paper(
                     s=s,
                     candidates=candidates,
                     open_market_ids=open_market_ids,
                     wallet=wallet,
                     max_open_positions=max_open_positions,
-                )
+                    )
                 await s.commit()
                 return
 
@@ -755,6 +766,100 @@ class PolymarketBot:
                 self.trades_today += 1
                 open_market_ids.add(m.id)
                 self._paper_window_quotes.pop(key, None)
+
+    async def _run_window_edge_live(self, *, s, candidates, open_market_ids: set[str], max_open_positions: int) -> None:
+        bid_price = max(0.01, float(getattr(settings, "POLYMARKET_WINDOW_EDGE_BID_PRICE", 0.02)))
+        bid_usd = max(0.25, float(getattr(settings, "POLYMARKET_WINDOW_EDGE_BID_USD_PER_SIDE", 1.00)))
+        open_grace = max(10, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_OPEN_GRACE_SECONDS", 120)))
+        cancel_after = max(10, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_CANCEL_AFTER_SECONDS", 120)))
+        max_pending = max(1, int(getattr(settings, "POLYMARKET_WINDOW_EDGE_MAX_PENDING_PER_SIDE", 8)))
+        now = time.time()
+
+        # 1) Cancel expired live resting orders.
+        expired = [k for k, q in self._live_window_orders.items() if float(q.get("expires_at", 0)) <= now]
+        for k in expired:
+            q = self._live_window_orders.pop(k, None)
+            if not q:
+                continue
+            oid = str(q.get("order_id") or "")
+            if oid:
+                cres = await cancel_live_order(oid)
+                await self._log(
+                    "INFO",
+                    f"window-edge LIVE cancel {q.get('market_id')} {q.get('side')} "
+                    f"order={oid} ok={bool(cres.get('ok'))}",
+                )
+
+        pending_count = len(self._live_window_orders)
+        for m in candidates[:40]:
+            if pending_count >= max_pending * 2:
+                break
+            if not self._is_micro_updown(m):
+                continue
+            if len(open_market_ids) >= max_open_positions:
+                break
+            duration = self._market_window_duration_seconds(m.title or "")
+            if duration <= 0:
+                continue
+            elapsed = duration - int(m.close_time_seconds or 0)
+            if elapsed < 0 or elapsed > open_grace:
+                continue
+
+            raw_tokens = (m.raw or {}).get("clobTokenIds")
+            if isinstance(raw_tokens, str):
+                try:
+                    raw_tokens = json.loads(raw_tokens)
+                except Exception:
+                    raw_tokens = []
+            if not isinstance(raw_tokens, list) or len(raw_tokens) < 2:
+                continue
+
+            # YES token index 0, NO token index 1
+            token_for_side = {"YES": str(raw_tokens[0]), "NO": str(raw_tokens[1])}
+            for side in ("YES", "NO"):
+                key = f"{m.id}:{side}"
+                if key in self._live_window_orders:
+                    continue
+
+                canary_ok, canary_reason, _meta = await check_polymarket_canary(
+                    s, mode="live_armed", order_usd=bid_usd
+                )
+                if not canary_ok:
+                    await self._log("INFO", f"window-edge LIVE blocked by canary: {canary_reason}")
+                    continue
+
+                size = max(5.0, round(bid_usd / max(bid_price, 0.001), 2))
+                lres = await place_live_order(
+                    token_id=token_for_side[side],
+                    price=bid_price,
+                    size=size,
+                    side="BUY",
+                )
+                if not lres.get("ok"):
+                    await self._log(
+                        "INFO",
+                        f"window-edge LIVE place fail {m.id} {side}: {lres.get('error')}",
+                    )
+                    continue
+
+                oid = str(lres.get("orderID") or "")
+                self._live_window_orders[key] = {
+                    "market_id": m.id,
+                    "market_title": m.title,
+                    "side": side,
+                    "token_id": token_for_side[side],
+                    "order_id": oid,
+                    "price": bid_price,
+                    "amount": bid_usd,
+                    "created_at": now,
+                    "expires_at": now + cancel_after,
+                }
+                pending_count += 1
+                await self._log(
+                    "INFO",
+                    f"window-edge LIVE quote {m.id} {side} @ {bid_price:.3f} "
+                    f"${bid_usd:.2f} order={oid}",
+                )
 
     @staticmethod
     def _market_window_duration_seconds(market_title: str) -> int:
