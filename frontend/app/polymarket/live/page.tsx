@@ -14,21 +14,19 @@ type BotStatus = {
   active_positions: number;
 };
 type Wallet = {
+  mode?: "paper" | "live";
   balance: number;
   trade_balance: number;
   vault_balance: number;
   actual_balance: number;
   trade_cap_usd: number;
   force_mode_a?: boolean;
-  live_trade_balance?: number;
-  live_vault_balance?: number;
-  live_actual_balance?: number;
-  live_trade_cap_usd?: number;
-  live_vault_sweeps_count?: number;
-  live_last_sweep_at?: string | null;
-  live_last_withdraw_at?: string | null;
-  live_withdrawn_total?: number;
-  live_auto_withdraw_enabled?: boolean;
+  vault_sweeps_count?: number;
+  last_sweep_at?: string | null;
+  last_withdraw_at?: string | null;
+  withdrawn_total?: number;
+  auto_withdraw_enabled?: boolean;
+  live_error?: string | null;
   total_pnl: number;
   wins: number;
   losses: number;
@@ -152,7 +150,7 @@ export default function PolymarketLivePage() {
   async function setLiveVaultCap() {
     const passcode = prompt("Passcode", "9472");
     if (!passcode) return;
-    const cap = prompt("Live trade cap USD", String(wallet?.live_trade_cap_usd ?? 30));
+    const cap = prompt("Live trade cap USD", String(wallet?.trade_cap_usd ?? 30));
     if (!cap) return;
     setBusy(true);
     try {
@@ -177,8 +175,8 @@ export default function PolymarketLivePage() {
     if (!passcode) return;
     setBusy(true);
     try {
-      await api("/polymarket/live/vault/auto-withdraw/toggle", { method: "POST", body: JSON.stringify({ passcode, enabled: !wallet?.live_auto_withdraw_enabled }) });
-      setActionMsg(`Auto-withdraw ${wallet?.live_auto_withdraw_enabled ? "disabled" : "enabled"}.`);
+      await api("/polymarket/live/vault/auto-withdraw/toggle", { method: "POST", body: JSON.stringify({ passcode, enabled: !wallet?.auto_withdraw_enabled }) });
+      setActionMsg(`Auto-withdraw ${wallet?.auto_withdraw_enabled ? "disabled" : "enabled"}.`);
       await refresh();
     } finally { setBusy(false); }
   }
@@ -198,14 +196,8 @@ export default function PolymarketLivePage() {
   const modeLabel = useMemo(() => {
     return "LIVE";
   }, []);
-  const liveTradeBalance =
-    (wallet?.trade_balance ?? wallet?.balance ?? 0) > 0
-      ? (wallet?.trade_balance ?? wallet?.balance ?? 0)
-      : (wallet?.live_trade_balance ?? wallet?.trade_balance ?? wallet?.balance ?? 0);
-  const liveTotalBalance =
-    (wallet?.actual_balance ?? wallet?.balance ?? 0) > 0
-      ? (wallet?.actual_balance ?? wallet?.balance ?? 0)
-      : (wallet?.live_actual_balance ?? wallet?.actual_balance ?? wallet?.balance ?? 0);
+  const liveTradeBalance = wallet?.trade_balance ?? wallet?.balance ?? 0;
+  const liveTotalBalance = wallet?.actual_balance ?? wallet?.balance ?? 0;
   const strategy = useMemo(() => {
     if (wallet?.force_mode_a) return "MODE-A";
     return (liveTradeBalance >= 5 ? "MODE-B" : "MODE-A");
@@ -431,18 +423,18 @@ export default function PolymarketLivePage() {
             <div className="card">
               <h3>LIVE VAULT</h3>
               <div className="operator-kv"><span>Trade Balance</span><strong>${liveTradeBalance.toFixed(2)}</strong></div>
-              <div className="operator-kv"><span>Vault Balance</span><strong>${(wallet?.live_vault_balance ?? 0).toFixed(2)}</strong></div>
+              <div className="operator-kv"><span>Vault Balance</span><strong>${(wallet?.vault_balance ?? 0).toFixed(2)}</strong></div>
               <div className="operator-kv"><span>Actual Balance</span><strong>${liveTotalBalance.toFixed(2)}</strong></div>
-              <div className="operator-kv"><span>Trade Cap</span><strong>${(wallet?.live_trade_cap_usd ?? 30).toFixed(2)}</strong></div>
-              <div className="operator-kv"><span>Sweeps</span><strong>{wallet?.live_vault_sweeps_count ?? 0}</strong></div>
-              <div className="operator-kv"><span>Last Sweep</span><strong>{wallet?.live_last_sweep_at ? new Date(wallet.live_last_sweep_at).toLocaleString() : "—"}</strong></div>
-              <div className="operator-kv"><span>Last Withdraw</span><strong>{wallet?.live_last_withdraw_at ? new Date(wallet.live_last_withdraw_at).toLocaleString() : "—"}</strong></div>
-              <div className="operator-kv"><span>Withdrawn Total</span><strong>${(wallet?.live_withdrawn_total ?? 0).toFixed(2)}</strong></div>
-              <div className="operator-kv"><span>Auto Withdraw</span><strong>{wallet?.live_auto_withdraw_enabled ? "ON" : "OFF"}</strong></div>
+              <div className="operator-kv"><span>Trade Cap</span><strong>${(wallet?.trade_cap_usd ?? 30).toFixed(2)}</strong></div>
+              <div className="operator-kv"><span>Sweeps</span><strong>{wallet?.vault_sweeps_count ?? 0}</strong></div>
+              <div className="operator-kv"><span>Last Sweep</span><strong>{wallet?.last_sweep_at ? new Date(wallet.last_sweep_at).toLocaleString() : "—"}</strong></div>
+              <div className="operator-kv"><span>Last Withdraw</span><strong>{wallet?.last_withdraw_at ? new Date(wallet.last_withdraw_at).toLocaleString() : "—"}</strong></div>
+              <div className="operator-kv"><span>Withdrawn Total</span><strong>${(wallet?.withdrawn_total ?? 0).toFixed(2)}</strong></div>
+              <div className="operator-kv"><span>Auto Withdraw</span><strong>{wallet?.auto_withdraw_enabled ? "ON" : "OFF"}</strong></div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8, marginTop: 10 }}>
                 <button className="btn btn-secondary" disabled={busy} onClick={setLiveVaultCap}>Set Cap</button>
                 <button className="btn btn-secondary" disabled={busy} onClick={manualWithdraw}>Manual Withdraw</button>
-                <button className="btn btn-secondary" disabled={busy} onClick={toggleAutoWithdraw}>{wallet?.live_auto_withdraw_enabled ? "Disable Auto Withdraw" : "Enable Auto Withdraw"}</button>
+                <button className="btn btn-secondary" disabled={busy} onClick={toggleAutoWithdraw}>{wallet?.auto_withdraw_enabled ? "Disable Auto Withdraw" : "Enable Auto Withdraw"}</button>
                 <button className="btn btn-stop" disabled={busy} onClick={unlockToTrade}>Emergency Unlock</button>
               </div>
             </div>

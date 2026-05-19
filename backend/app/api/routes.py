@@ -6,10 +6,12 @@ import csv
 import io
 import os
 import shutil
+import re
+import uuid
 from datetime import datetime, timedelta, timezone
 import httpx
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import delete, desc, func, select, text
@@ -53,6 +55,176 @@ def _poly_live_auto_withdraw_enabled() -> bool:
     if _POLY_LIVE_AUTO_WITHDRAW_OVERRIDE is None:
         return bool(settings.POLY_LIVE_AUTO_WITHDRAW_ENABLED)
     return bool(_POLY_LIVE_AUTO_WITHDRAW_OVERRIDE)
+
+
+class TradingViewWebhookBody(BaseModel):
+    symbol: str = ""
+    timeframe: str = ""
+    time: int | None = None
+    close: float | None = None
+    decision: str | None = None
+    confidence: float | int | None = None
+    tp: float | None = None
+    sl: float | None = None
+    signal_id: str | None = None
+    strategy: str | None = None
+    meta: dict | None = None
+    action: str | None = None
+    qty: float | None = None
+    mode: str | None = None
+
+
+class TradingViewTestOrderBody(BaseModel):
+    action: str  # SELL to open short, BUY to close short
+    symbol: str = "BTCUSD"
+    close: float | None = None
+    mode: str = "paper"
+    timeframe: str = "1"
+    confidence: float | int | None = 70
+    tp: float | None = None
+    sl: float | None = None
+
+
+def _tv_normalize_symbol(raw: str) -> str:
+    s = (raw or "").upper().strip()
+    if not s:
+        return "BTCUSDT"
+    if ":" in s:
+        s = s.split(":")[-1]
+    if s.endswith("PERP"):
+        s = s[:-4]
+    if s.endswith("USD") and not s.endswith("USDT"):
+        s = s + "T"
+    if s in {"BTC", "ETH", "SOL", "BNB", "XRP"}:
+        return s + "USDT"
+    return s
+
+
+def _tv_parse_text_message(msg: str) -> dict:
+    text = (msg or "").strip()
+    action = None
+    if re.search(r"\border\s+sell\b", text, flags=re.IGNORECASE):
+        action = "SELL"
+    elif re.search(r"\border\s+buy\b", text, flags=re.IGNORECASE):
+        action = "BUY"
+
+    qty = None
+    m_qty = re.search(r"@\s*([-+]?\d*\.?\d+)", text)
+    if m_qty:
+        try:
+            qty = float(m_qty.group(1))
+        except Exception:
+            qty = None
+
+    symbol = ""
+    m_sym = re.search(r"on\s+([A-Z0-9:\-_.]+)", text, flags=re.IGNORECASE)
+    if m_sym:
+        symbol = m_sym.group(1).strip().upper()
+
+    return {"action": action, "qty": qty, "symbol": symbol}
+
+
+async def _candle_ensure_wallet(session: AsyncSession) -> CandleWallet:
+    w = (await session.execute(select(CandleWallet).where(CandleWallet.id == 1))).scalar_one_or_none()
+    if w is None:
+        w = CandleWallet(
+            id=1,
+            paper_balance=settings.CANDLE_PAPER_STARTING_BALANCE,
+            paper_starting_balance=settings.CANDLE_PAPER_STARTING_BALANCE,
+        )
+        session.add(w)
+        await session.flush()
+    return w
+
+
+async def _tradingview_openai_decide(payload: TradingViewWebhookBody) -> dict:
+    """Ask OpenAI for BUY/NO_BUY + TP/SL reasoning from TradingView snapshot."""
+    if not settings.OPENAI_API_KEY:
+        return {
+            "decision": "NO_BUY",
+            "confidence": 0,
+            "tp": payload.tp,
+            "sl": payload.sl,
+            "reason": "OPENAI_API_KEY missing; configure backend .env",
+            "model": None,
+            "provider": "fallback",
+        }
+
+    system_prompt = (
+        "You are a strict intraday trading advisor for 1-minute candles. "
+        "Return only a compact JSON object with keys: decision, confidence, tp, sl, reason. "
+        "decision must be BUY or NO_BUY. confidence must be 0-100 integer. "
+        "tp and sl must be numbers (or null). Keep reason under 160 chars."
+    )
+    user_payload = {
+        "symbol": payload.symbol,
+        "timeframe": payload.timeframe,
+        "time": payload.time,
+        "close": payload.close,
+        "tv_decision": payload.decision,
+        "tv_confidence": payload.confidence,
+        "tv_tp": payload.tp,
+        "tv_sl": payload.sl,
+        "strategy": payload.strategy,
+        "meta": payload.meta or {},
+    }
+    req_json = {
+        "model": settings.TRADINGVIEW_OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"TradingView snapshot: {user_payload}"},
+        ],
+        "temperature": 0.2,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/responses",
+                headers={
+                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=req_json,
+            )
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        return {
+            "decision": "NO_BUY",
+            "confidence": 0,
+            "tp": payload.tp,
+            "sl": payload.sl,
+            "reason": f"openai call failed: {str(e)[:120]}",
+            "model": settings.TRADINGVIEW_OPENAI_MODEL,
+            "provider": "fallback",
+        }
+
+    output_text = str(data.get("output_text") or "").strip()
+    parsed: dict = {}
+    if output_text.startswith("{") and output_text.endswith("}"):
+        try:
+            import json
+            parsed = json.loads(output_text)
+        except Exception:
+            parsed = {}
+    decision = str(parsed.get("decision") or "").upper()
+    if decision not in {"BUY", "NO_BUY"}:
+        decision = "NO_BUY"
+    confidence = int(parsed.get("confidence") or 0)
+    confidence = max(0, min(100, confidence))
+    tp = parsed.get("tp", payload.tp)
+    sl = parsed.get("sl", payload.sl)
+    reason = str(parsed.get("reason") or "no reason").strip()[:160]
+    return {
+        "decision": decision,
+        "confidence": confidence,
+        "tp": tp,
+        "sl": sl,
+        "reason": reason,
+        "model": settings.TRADINGVIEW_OPENAI_MODEL,
+        "provider": "openai",
+        "raw_text": output_text[:500],
+    }
 
 
 # ---------- Bot ----------
@@ -670,40 +842,50 @@ async def _polymarket_wallet_by_mode(current_mode: str, session: AsyncSession) -
     total_trades = len(closed)
     win_rate = (wins / total_trades * 100) if total_trades else 0.0
 
-    return {
+    common = {
+        "mode": "live" if is_live else "paper",
         "balance": round(balance, 4),
-        "trade_balance": round((w.trade_balance if not is_live else balance), 4),
-        "vault_balance": round((w.vault_balance if not is_live else 0.0), 4),
-        "actual_balance": round((w.trade_balance + w.vault_balance) if not is_live else balance, 4),
-        "trade_cap_usd": round((w.trade_cap_usd if not is_live else float(settings.POLYMARKET_VAULT_TRADE_CAP_USD)), 4),
         "force_mode_a": bool(settings.POLYMARKET_FORCE_MODE_A),
-        "vault_locked": True,
-        "vault_sweeps_count": int(w.vault_sweeps_count if not is_live else 0),
-        "last_sweep_at": (w.last_sweep_at.isoformat() if (not is_live and w.last_sweep_at) else None),
         "total_pnl": round(total_pnl, 4),
         "total_trades": total_trades,
         "wins": wins,
         "losses": losses,
         "win_rate": round(win_rate, 2),
-        "live_error": live_error,
-        "live_trade_balance": round(live_trade_balance, 4),
-        "live_vault_balance": round(live_vault_balance, 4),
-        "live_actual_balance": round(live_actual_balance, 4),
-        "live_trade_cap_usd": round(float(w.live_trade_cap_usd or settings.POLY_LIVE_TRADE_CAP_USD), 4),
-        "live_vault_locked": True,
-        "live_vault_sweeps_count": int(w.live_vault_sweeps_count or 0),
-        "live_last_sweep_at": (w.live_last_sweep_at.isoformat() if w.live_last_sweep_at else None),
-        "live_last_withdraw_at": (w.live_last_withdraw_at.isoformat() if w.live_last_withdraw_at else None),
-        "live_withdrawn_total": round(float(w.live_withdrawn_total or 0.0), 4),
-        "live_vault_enabled": bool(settings.POLY_LIVE_VAULT_ENABLED),
-        "live_auto_withdraw_enabled": bool(_poly_live_auto_withdraw_enabled()),
+    }
+    if is_live:
+        return {
+            **common,
+            "trade_balance": round(live_trade_balance, 4),
+            "vault_balance": round(live_vault_balance, 4),
+            "actual_balance": round(live_actual_balance, 4),
+            "trade_cap_usd": round(float(w.live_trade_cap_usd or settings.POLY_LIVE_TRADE_CAP_USD), 4),
+            "vault_locked": True,
+            "vault_sweeps_count": int(w.live_vault_sweeps_count or 0),
+            "last_sweep_at": (w.live_last_sweep_at.isoformat() if w.live_last_sweep_at else None),
+            "last_withdraw_at": (w.live_last_withdraw_at.isoformat() if w.live_last_withdraw_at else None),
+            "withdrawn_total": round(float(w.live_withdrawn_total or 0.0), 4),
+            "vault_enabled": bool(settings.POLY_LIVE_VAULT_ENABLED),
+            "auto_withdraw_enabled": bool(_poly_live_auto_withdraw_enabled()),
+            "live_error": live_error,
+        }
+    return {
+        **common,
+        "trade_balance": round(w.trade_balance, 4),
+        "vault_balance": round(w.vault_balance, 4),
+        "actual_balance": round(w.trade_balance + w.vault_balance, 4),
+        "trade_cap_usd": round(w.trade_cap_usd, 4),
+        "vault_locked": True,
+        "vault_sweeps_count": int(w.vault_sweeps_count or 0),
+        "last_sweep_at": (w.last_sweep_at.isoformat() if w.last_sweep_at else None),
     }
 
 
 @router.get("/polymarket/wallet")
 async def polymarket_wallet_get(session: AsyncSession = Depends(get_session)):
-    # Backward-compatible legacy endpoint: paper-only.
-    return await _polymarket_wallet_by_mode("paper", session)
+    # Backward-compatible legacy endpoint: now follows current mode.
+    state = mode_guard.get("polymarket")
+    mode = "live" if state.mode == "live_armed" else "paper"
+    return await _polymarket_wallet_by_mode(mode, session)
 
 
 @router.get("/polymarket/paper/wallet")
@@ -1790,6 +1972,377 @@ async def _time_to_close_seconds(kalshi, market_id: str) -> int | None:
 # ════════════════════════════════════════════════════════════════════
 
 
+# ── TradingView webhook (AI advisory) ───────────────────────────────
+@router.post("/tradingview/webhook")
+async def tradingview_webhook(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    raw_json: dict = {}
+    raw_text = ""
+    try:
+        raw_json = await request.json()
+        if not isinstance(raw_json, dict):
+            raw_json = {}
+    except Exception:
+        raw_json = {}
+    if not raw_json:
+        raw_text = (await request.body()).decode("utf-8", errors="ignore").strip()
+        parsed_text = _tv_parse_text_message(raw_text)
+        raw_json = {
+            "symbol": parsed_text.get("symbol") or "BTCUSD",
+            "action": parsed_text.get("action"),
+            "qty": parsed_text.get("qty"),
+            "meta": {"raw_message": raw_text},
+        }
+    body = TradingViewWebhookBody(**raw_json)
+
+    # Optional shared secret check (header takes precedence over payload meta).
+    expected = settings.TRADINGVIEW_WEBHOOK_SECRET.strip()
+    provided = (request.headers.get("x-tv-secret") or "").strip()
+    if not provided and isinstance(body.meta, dict):
+        provided = str(body.meta.get("secret") or "").strip()
+    if expected and provided != expected:
+        raise HTTPException(status_code=401, detail="invalid tradingview webhook secret")
+
+    action = (body.action or "").upper().strip()
+    if not action:
+        tv_decision = (body.decision or "").upper().strip()
+        action = "SELL" if tv_decision in {"SELL", "SHORT"} else "BUY" if tv_decision in {"BUY", "LONG"} else ""
+    symbol = _tv_normalize_symbol(body.symbol)
+    timeframe = body.timeframe or "1"
+    px = float(body.close) if body.close is not None else None
+    if px is None:
+        try:
+            px = float(await binance_data.get_price(symbol))
+        except Exception:
+            px = None
+    if px is None or px <= 0:
+        raise HTTPException(status_code=400, detail="missing/invalid close price and price fetch failed")
+
+    ai = await _tradingview_openai_decide(body)
+    webhook_mode = (body.mode or "paper").lower()
+    if webhook_mode not in {"paper", "live"}:
+        webhook_mode = "paper"
+    # user requested "direct short"; webhook keeps only short entries.
+    short_only = True
+
+    executed = {"mode": webhook_mode, "action": action or "NONE", "symbol": symbol, "price": px}
+    wallet_state = None
+
+    # Open/close paper positions from webhook signal.
+    # SELL => open short (if no open short already for symbol)
+    # BUY  => close open short(s) for symbol
+    if webhook_mode == "paper":
+        w = await _candle_ensure_wallet(session)
+        open_rows = (
+            await session.execute(
+                select(CandleTrade).where(
+                    CandleTrade.mode == "paper",
+                    CandleTrade.symbol == symbol,
+                    CandleTrade.status == "OPEN",
+                )
+            )
+        ).scalars().all()
+
+        if action == "SELL":
+            if short_only:
+                has_open_short = any(t.direction == "SHORT" for t in open_rows)
+                if not has_open_short:
+                    risk_pct = max(0.001, float(settings.CANDLE_RISK_PER_TRADE_PCT))
+                    risk_usd = float(w.paper_balance) * risk_pct
+                    sl_price = float(body.sl) if body.sl and body.sl > px else px * 1.004
+                    tp_price = float(body.tp) if body.tp and body.tp < px else px * 0.992
+                    stop_distance = max(1e-6, sl_price - px)
+                    qty = float(body.qty) if body.qty and body.qty > 0 else (risk_usd / stop_distance)
+                    notional = qty * px
+                    cap_abs = float(settings.CANDLE_PAPER_MAX_NOTIONAL_USD)
+                    cap_pct = float(settings.CANDLE_PAPER_MAX_NOTIONAL_PCT_EQUITY) * float(w.paper_balance)
+                    cap = max(0.0, min(cap_abs, cap_pct if cap_pct > 0 else cap_abs))
+                    if cap > 0 and notional > cap:
+                        notional = cap
+                        qty = notional / px
+                    if notional <= 0 or notional > float(w.paper_balance):
+                        executed["status"] = "rejected_insufficient_balance"
+                    else:
+                        t = CandleTrade(
+                            id=str(uuid.uuid4()),
+                            symbol=symbol,
+                            interval=timeframe,
+                            direction="SHORT",
+                            qty=float(round(qty, 8)),
+                            notional_usd=float(round(notional, 6)),
+                            entry_price=px,
+                            stop_loss=sl_price,
+                            take_profit=tp_price,
+                            current_price=px,
+                            status="OPEN",
+                            htf_bias="down",
+                            setup_type="tv_webhook",
+                            confidence=float(body.confidence or 0),
+                            rr_target=2.0,
+                            reasoning=f"TradingView SELL webhook; ai={ai.get('decision')}",
+                            mode="paper",
+                        )
+                        session.add(t)
+                        w.paper_balance = round(float(w.paper_balance) - float(notional), 6)
+                        executed.update({"status": "opened_short", "trade_id": t.id, "qty": t.qty, "notional_usd": t.notional_usd})
+                else:
+                    executed["status"] = "skipped_short_already_open"
+            else:
+                executed["status"] = "skipped_not_short_mode"
+        elif action == "BUY":
+            closed = 0
+            pnl_sum = 0.0
+            for t in open_rows:
+                if t.direction != "SHORT":
+                    continue
+                pnl = (t.entry_price - px) * t.qty
+                t.current_price = px
+                t.exit_price = px
+                t.pnl_usd = round(float(pnl), 6)
+                t.pnl_pct = round(((t.entry_price - px) / t.entry_price * 100.0) if t.entry_price else 0.0, 6)
+                t.status = "CLOSED_TV_SIGNAL"
+                t.closed_at = datetime.now(timezone.utc)
+                w.paper_balance = round(float(w.paper_balance) + float(t.notional_usd) + float(pnl), 6)
+                w.paper_total_pnl = round(float(w.paper_total_pnl) + float(pnl), 6)
+                w.paper_total_trades = int(w.paper_total_trades or 0) + 1
+                if pnl >= 0:
+                    w.paper_wins = int(w.paper_wins or 0) + 1
+                else:
+                    w.paper_losses = int(w.paper_losses or 0) + 1
+                closed += 1
+                pnl_sum += float(pnl)
+            executed.update({"status": "closed_shorts" if closed else "no_short_to_close", "closed_count": closed, "pnl_usd": round(pnl_sum, 6)})
+        else:
+            executed["status"] = "ignored_no_action"
+
+        wallet_state = {
+            "paper_balance": round(float(w.paper_balance or 0), 6),
+            "paper_total_pnl": round(float(w.paper_total_pnl or 0), 6),
+            "paper_total_trades": int(w.paper_total_trades or 0),
+            "paper_wins": int(w.paper_wins or 0),
+            "paper_losses": int(w.paper_losses or 0),
+        }
+
+    response = {
+        "ok": True,
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "time": body.time,
+        "close": px,
+        "tv_signal": {
+            "decision": body.decision,
+            "action": action,
+            "confidence": body.confidence,
+            "tp": body.tp,
+            "sl": body.sl,
+            "signal_id": body.signal_id,
+            "strategy": body.strategy,
+        },
+        "ai_signal": ai,
+        "execution": executed,
+        "wallet": wallet_state,
+    }
+
+    # Persist a concise audit trail in bot_logs.
+    session.add(BotLog(
+        level="INFO",
+        message=f"tradingview {body.symbol} -> {ai.get('decision')} conf={ai.get('confidence')}",
+        metadata_json={
+            "platform": "tradingview",
+            "symbol": symbol,
+            "timeframe": body.timeframe,
+            "signal_id": body.signal_id,
+            "strategy": body.strategy,
+            "tv_decision": body.decision,
+            "tv_action": action,
+            "tv_confidence": body.confidence,
+            "tv_tp": body.tp,
+            "tv_sl": body.sl,
+            "ai": ai,
+            "execution": executed,
+            "raw_text": raw_text[:500] if raw_text else None,
+        },
+    ))
+    await session.commit()
+    await bus.publish("tradingview:signal", response)
+    return response
+
+
+@router.post("/tradingview/test-order")
+async def tradingview_test_order(
+    body: TradingViewTestOrderBody,
+    session: AsyncSession = Depends(get_session),
+):
+    """Manual test hook to simulate TradingView alerts without waiting for signals."""
+    payload = TradingViewWebhookBody(
+        symbol=body.symbol,
+        timeframe=body.timeframe,
+        close=body.close,
+        action=(body.action or "").upper().strip(),
+        mode=body.mode,
+        confidence=body.confidence,
+        tp=body.tp,
+        sl=body.sl,
+        strategy="manual_test_order",
+        meta={"source": "manual_test_order"},
+    )
+
+    # Reuse the same execution behavior as /tradingview/webhook.
+    action = payload.action or ""
+    symbol = _tv_normalize_symbol(payload.symbol)
+    px = float(payload.close) if payload.close is not None else None
+    if px is None:
+        try:
+            px = float(await binance_data.get_price(symbol))
+        except Exception:
+            px = None
+    if px is None or px <= 0:
+        raise HTTPException(status_code=400, detail="missing/invalid close price and price fetch failed")
+
+    webhook_mode = (payload.mode or "paper").lower()
+    if webhook_mode not in {"paper", "live"}:
+        webhook_mode = "paper"
+    short_only = True
+
+    ai = await _tradingview_openai_decide(payload)
+    executed = {"mode": webhook_mode, "action": action or "NONE", "symbol": symbol, "price": px}
+    wallet_state = None
+
+    if webhook_mode == "paper":
+        w = await _candle_ensure_wallet(session)
+        open_rows = (
+            await session.execute(
+                select(CandleTrade).where(
+                    CandleTrade.mode == "paper",
+                    CandleTrade.symbol == symbol,
+                    CandleTrade.status == "OPEN",
+                )
+            )
+        ).scalars().all()
+
+        if action == "SELL":
+            has_open_short = any(t.direction == "SHORT" for t in open_rows)
+            if short_only and not has_open_short:
+                risk_pct = max(0.001, float(settings.CANDLE_RISK_PER_TRADE_PCT))
+                risk_usd = float(w.paper_balance) * risk_pct
+                sl_price = float(payload.sl) if payload.sl and payload.sl > px else px * 1.004
+                tp_price = float(payload.tp) if payload.tp and payload.tp < px else px * 0.992
+                stop_distance = max(1e-6, sl_price - px)
+                qty = risk_usd / stop_distance
+                notional = qty * px
+                cap_abs = float(settings.CANDLE_PAPER_MAX_NOTIONAL_USD)
+                cap_pct = float(settings.CANDLE_PAPER_MAX_NOTIONAL_PCT_EQUITY) * float(w.paper_balance)
+                cap = max(0.0, min(cap_abs, cap_pct if cap_pct > 0 else cap_abs))
+                if cap > 0 and notional > cap:
+                    notional = cap
+                    qty = notional / px
+                if notional <= 0 or notional > float(w.paper_balance):
+                    executed["status"] = "rejected_insufficient_balance"
+                else:
+                    t = CandleTrade(
+                        id=str(uuid.uuid4()),
+                        symbol=symbol,
+                        interval=payload.timeframe or "1",
+                        direction="SHORT",
+                        qty=float(round(qty, 8)),
+                        notional_usd=float(round(notional, 6)),
+                        entry_price=px,
+                        stop_loss=sl_price,
+                        take_profit=tp_price,
+                        current_price=px,
+                        status="OPEN",
+                        htf_bias="down",
+                        setup_type="tv_manual_test",
+                        confidence=float(payload.confidence or 0),
+                        rr_target=2.0,
+                        reasoning=f"Manual test SELL; ai={ai.get('decision')}",
+                        mode="paper",
+                    )
+                    session.add(t)
+                    w.paper_balance = round(float(w.paper_balance) - float(notional), 6)
+                    executed.update({"status": "opened_short", "trade_id": t.id, "qty": t.qty, "notional_usd": t.notional_usd})
+            else:
+                executed["status"] = "skipped_short_already_open"
+        elif action == "BUY":
+            closed = 0
+            pnl_sum = 0.0
+            for t in open_rows:
+                if t.direction != "SHORT":
+                    continue
+                pnl = (t.entry_price - px) * t.qty
+                t.current_price = px
+                t.exit_price = px
+                t.pnl_usd = round(float(pnl), 6)
+                t.pnl_pct = round(((t.entry_price - px) / t.entry_price * 100.0) if t.entry_price else 0.0, 6)
+                t.status = "CLOSED_TV_SIGNAL"
+                t.closed_at = datetime.now(timezone.utc)
+                w.paper_balance = round(float(w.paper_balance) + float(t.notional_usd) + float(pnl), 6)
+                w.paper_total_pnl = round(float(w.paper_total_pnl) + float(pnl), 6)
+                w.paper_total_trades = int(w.paper_total_trades or 0) + 1
+                if pnl >= 0:
+                    w.paper_wins = int(w.paper_wins or 0) + 1
+                else:
+                    w.paper_losses = int(w.paper_losses or 0) + 1
+                closed += 1
+                pnl_sum += float(pnl)
+            executed.update({"status": "closed_shorts" if closed else "no_short_to_close", "closed_count": closed, "pnl_usd": round(pnl_sum, 6)})
+        else:
+            raise HTTPException(status_code=400, detail="action must be SELL or BUY")
+
+        wallet_state = {
+            "paper_balance": round(float(w.paper_balance or 0), 6),
+            "paper_total_pnl": round(float(w.paper_total_pnl or 0), 6),
+            "paper_total_trades": int(w.paper_total_trades or 0),
+            "paper_wins": int(w.paper_wins or 0),
+            "paper_losses": int(w.paper_losses or 0),
+        }
+
+    session.add(BotLog(
+        level="INFO",
+        message=f"tradingview test-order {symbol} {action}",
+        metadata_json={
+            "platform": "tradingview",
+            "symbol": symbol,
+            "action": action,
+            "execution": executed,
+            "ai": ai,
+            "source": "manual_test_order",
+        },
+    ))
+    await session.commit()
+    await bus.publish("tradingview:signal", {"test": True, "execution": executed})
+    return {
+        "ok": True,
+        "test": True,
+        "symbol": symbol,
+        "close": px,
+        "execution": executed,
+        "wallet": wallet_state,
+        "ai_signal": ai,
+    }
+
+
+@router.get("/tradingview/test-order/sell")
+async def tradingview_test_order_sell(symbol: str = "BTCUSD", mode: str = "paper"):
+    """Browser-friendly test: open short via GET."""
+    payload = {"action": "SELL", "symbol": symbol, "mode": mode}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+        r = await client.post("http://localhost:4000/api/tradingview/test-order", json=payload)
+        return r.json()
+
+
+@router.get("/tradingview/test-order/buy")
+async def tradingview_test_order_buy(symbol: str = "BTCUSD", mode: str = "paper"):
+    """Browser-friendly test: close short via GET."""
+    payload = {"action": "BUY", "symbol": symbol, "mode": mode}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+        r = await client.post("http://localhost:4000/api/tradingview/test-order", json=payload)
+        return r.json()
+
+
 # ── Market data (public, no auth) ────────────────────────────────────
 class CandleBotStartBody(BaseModel):
     strategy_id: str
@@ -1816,6 +2369,65 @@ async def candle_klines(symbol: str = "BTCUSDT", interval: str = "5m", limit: in
 async def candle_price(symbol: str = "BTCUSDT"):
     price = await binance_data.get_price(symbol)
     return {"symbol": symbol.upper(), "price": price}
+
+
+@router.get("/binance/spot/assets")
+async def binance_spot_assets():
+    """Read-only Binance spot assets snapshot for sheet/dashboard sync."""
+    usdt_free, balances, err = await binance_live.get_account_balance_safe()
+    if err:
+        return {
+            "ok": False,
+            "error": err,
+            "assets": [],
+            "totals": {"estimated_usdt": 0.0, "usdt_free": 0.0},
+        }
+
+    rows: list[dict] = []
+    total_usdt_value = 0.0
+    for asset, v in sorted(balances.items()):
+        free = float(v.get("free", 0.0))
+        locked = float(v.get("locked", 0.0))
+        qty = free + locked
+        if qty <= 0:
+            continue
+
+        pair = f"{asset}USDT"
+        if asset == "USDT":
+            price = 1.0
+        elif asset in {"USD", "USDC", "BUSD", "FDUSD", "TUSD"}:
+            price = 1.0
+            pair = f"{asset}USDT"
+        else:
+            try:
+                price = float(await binance_data.get_price(pair))
+            except Exception:
+                price = 0.0
+
+        value_usdt = qty * price
+        total_usdt_value += value_usdt
+        rows.append(
+            {
+                "asset": asset,
+                "free": round(free, 10),
+                "locked": round(locked, 10),
+                "quantity": round(qty, 10),
+                "pair": pair,
+                "price_usdt": round(price, 8),
+                "value_usdt": round(value_usdt, 8),
+            }
+        )
+
+    rows.sort(key=lambda x: x["value_usdt"], reverse=True)
+    return {
+        "ok": True,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "assets": rows,
+        "totals": {
+            "estimated_usdt": round(total_usdt_value, 8),
+            "usdt_free": round(float(usdt_free or 0.0), 8),
+        },
+    }
 
 
 @router.get("/candle/analyze")
