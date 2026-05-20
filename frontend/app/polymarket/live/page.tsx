@@ -59,6 +59,15 @@ type Preflight = {
   };
   resolved: { funder?: string | null; signature_type: number; client_ready: boolean; proxy_configured: boolean };
 };
+type ErrorItem = {
+  key: string;
+  title: string;
+  severity: "critical" | "warning";
+  count: number;
+  lastSeen: string;
+  example: string;
+  action: string;
+};
 
 function parseTradeTime(raw?: string | null): number {
   if (!raw) return NaN;
@@ -310,6 +319,97 @@ export default function PolymarketLivePage() {
     return [min - pad, max + pad];
   }, [monthPnlSeries]);
 
+  const errorItems = useMemo<ErrorItem[]>(() => {
+    const src = [...logs].reverse();
+    const bucket = new Map<string, ErrorItem>();
+
+    function upsert(
+      key: string,
+      title: string,
+      severity: "critical" | "warning",
+      entry: LogEntry,
+      action: string
+    ) {
+      const prev = bucket.get(key);
+      if (!prev) {
+        bucket.set(key, {
+          key,
+          title,
+          severity,
+          count: 1,
+          lastSeen: formatLogTime(entry),
+          example: entry.message,
+          action,
+        });
+        return;
+      }
+      prev.count += 1;
+      if (!prev.example) prev.example = entry.message;
+      if (!prev.lastSeen) prev.lastSeen = formatLogTime(entry);
+    }
+
+    for (const l of src) {
+      const msg = (l.message || "").toLowerCase();
+      if (!msg) continue;
+      if (msg.includes("geo_blocked")) {
+        upsert(
+          "geo_blocked",
+          "Geo Blocked (orders not reaching CLOB)",
+          "critical",
+          l,
+          "Verify POLYMARKET_PROXY_URL, redeploy, then restart bot."
+        );
+        continue;
+      }
+      if (msg.includes("proxy") && (msg.includes("fail") || msg.includes("error"))) {
+        upsert(
+          "proxy_fail",
+          "Proxy Failure",
+          "critical",
+          l,
+          "Check proxy user/pass/host/port and remove trailing slash."
+        );
+        continue;
+      }
+      if (msg.includes("auth") || msg.includes("signature") || msg.includes("funder")) {
+        upsert(
+          "auth_fail",
+          "Auth / Signature / Funder Mismatch",
+          "critical",
+          l,
+          "Re-check signatureType and funder address pairing in env."
+        );
+        continue;
+      }
+      if (msg.includes("balance") && (msg.includes("fail") || msg.includes("error") || msg.includes("unknown"))) {
+        upsert(
+          "balance_fail",
+          "Balance Fetch Failure",
+          "warning",
+          l,
+          "Check CLOB connectivity and API creds, then refresh preflight."
+        );
+        continue;
+      }
+      if (l.level === "ERROR" || msg.includes("place fail") || msg.includes("request exception")) {
+        upsert(
+          "other_error",
+          "Other Runtime Error",
+          "warning",
+          l,
+          "Open log details and inspect the first failing market/order."
+        );
+      }
+    }
+
+    const items = Array.from(bucket.values());
+    items.sort((a, b) => {
+      if (a.severity !== b.severity) return a.severity === "critical" ? -1 : 1;
+      return b.count - a.count;
+    });
+    return items.slice(0, 6);
+  }, [logs]);
+
   return (
     <div style={{ minHeight: "100vh", background: "#10131a", color: "#e0e2ec" }}>
       <div className="container" style={{ maxWidth: 1480, paddingTop: 12, paddingBottom: 24 }}>
@@ -444,6 +544,40 @@ export default function PolymarketLivePage() {
             </div>
           </div>
           <div className="operator-side">
+            <div className="card">
+              <h3>LIVE ERROR CENTER</h3>
+              {errorItems.length === 0 && (
+                <div style={{ fontSize: 12, color: "#63ffbe", marginTop: 6 }}>
+                  No active critical errors detected in recent logs.
+                </div>
+              )}
+              {errorItems.length > 0 && (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8, marginTop: 8 }}>
+                  {errorItems.map((e) => (
+                    <div
+                      key={e.key}
+                      style={{
+                        border: `1px solid ${e.severity === "critical" ? "#6b2c35" : "#5a4a1d"}`,
+                        background: e.severity === "critical" ? "rgba(255,107,129,0.10)" : "rgba(255,207,107,0.08)",
+                        borderRadius: 8,
+                        padding: "8px 10px",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                        <strong style={{ color: e.severity === "critical" ? "#ff9cab" : "#ffd37d", fontSize: 12 }}>{e.title}</strong>
+                        <span style={{ fontSize: 11, color: "#b7c7e5" }}>{e.count}x · last {e.lastSeen}</span>
+                      </div>
+                      <div style={{ marginTop: 4, fontSize: 11, color: "#dbe6ff", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
+                        {e.example}
+                      </div>
+                      <div style={{ marginTop: 6, fontSize: 11, color: "#9fd0ff" }}>
+                        Fix: {e.action}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
             <div className="card">
               <h3>LIVE CONTROLS</h3>
               <div className="operator-kv"><span>Mode</span><strong>{modeLabel}</strong></div>
