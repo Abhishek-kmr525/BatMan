@@ -7,7 +7,7 @@ from typing import Literal
 
 from app.core.config import settings
 
-Platform = Literal["kalshi", "polymarket"]
+Platform = Literal["kalshi", "polymarket", "candle"]
 Mode = Literal["paper", "live_requested", "live_armed"]
 
 
@@ -29,6 +29,8 @@ class PlatformModeState:
     def live_enabled(self) -> bool:
         if self.platform == "kalshi":
             return settings.KALSHI_LIVE_ENABLED
+        if self.platform == "candle":
+            return settings.CANDLE_LIVE_ENABLED
         return settings.POLYMARKET_LIVE_ENABLED
 
     def to_dict(self) -> dict:
@@ -49,6 +51,7 @@ class ModeGuard:
         self._state: dict[Platform, PlatformModeState] = {
             "kalshi": PlatformModeState(platform="kalshi"),
             "polymarket": PlatformModeState(platform="polymarket"),
+            "candle": PlatformModeState(platform="candle"),
         }
 
     def get(self, platform: Platform) -> PlatformModeState:

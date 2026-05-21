@@ -86,6 +86,8 @@ export default function ClientShell({ children }: { children: React.ReactNode })
     { href: "/bots", label: "Kalshi Live", short: "K-LIVE" },
     { href: "/polymarket", label: "Polymarket Paper", short: "P-PAPER" },
     { href: "/polymarket/live", label: "Polymarket Live", short: "P-LIVE" },
+    { href: "/candle/paper", label: "Candle Paper", short: "C-PAPER" },
+    { href: "/candle/live", label: "Candle Live", short: "C-LIVE" },
   ];
 
   if (pathname === "/") {

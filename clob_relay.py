@@ -24,13 +24,29 @@ import ssl
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 UPSTREAM = "https://clob.polymarket.com"
+BINANCE_UPSTREAM = "https://api.binance.com"
 PORT = 8765
 SKIP_HEADERS = {"host", "transfer-encoding", "connection", "keep-alive"}
+# Cloudflare adds these on tunnel forwarding; Binance's CDN rejects requests
+# carrying them. Strip everything matching these prefixes before forwarding.
+SKIP_HEADER_PREFIXES = ("cf-", "x-forwarded-", "x-real-ip", "cdn-loop", "x-amzn-")
 
 
 class ClobRelayHandler(BaseHTTPRequestHandler):
     def _relay(self):
-        url = UPSTREAM + self.path
+        # Path-based routing:
+        #   /binance/<x>  → https://api.binance.com/<x>     (Binance Spot)
+        #   everything else → https://clob.polymarket.com   (Polymarket CLOB)
+        path = self.path
+        if path.startswith("/binance/"):
+            upstream = BINANCE_UPSTREAM
+            forwarded_path = path[len("/binance"):]
+            host_header = "api.binance.com"
+        else:
+            upstream = UPSTREAM
+            forwarded_path = path
+            host_header = "clob.polymarket.com"
+        url = upstream + forwarded_path
         body = None
         length = self.headers.get("content-length")
         if length:
@@ -39,8 +55,13 @@ class ClobRelayHandler(BaseHTTPRequestHandler):
         fwd_headers = {
             k: v for k, v in self.headers.items()
             if k.lower() not in SKIP_HEADERS
+            and not any(k.lower().startswith(p) for p in SKIP_HEADER_PREFIXES)
         }
-        fwd_headers["host"] = "clob.polymarket.com"
+        # Binance's CloudFront rejects empty / bot-like UAs. Force a normal one.
+        if upstream == BINANCE_UPSTREAM:
+            fwd_headers["user-agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36"
+            fwd_headers["accept"] = "application/json, text/plain, */*"
+        fwd_headers["host"] = host_header
 
         req = urllib.request.Request(
             url, data=body, headers=fwd_headers, method=self.command

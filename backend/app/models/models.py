@@ -138,3 +138,59 @@ class PolyVaultEvent(Base):
     amount_usd: Mapped[float] = mapped_column(Float, default=0.0)
     meta_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
+
+
+class CandleTrade(Base):
+    """Crypto candle-strategy trade (Binance BTC/ETH spot)."""
+    __tablename__ = "candle_trades"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)  # BTCUSDT, ETHUSDT
+    interval: Mapped[str] = mapped_column(String(8))  # 5m, 15m, 1h
+    direction: Mapped[str] = mapped_column(String(10))  # LONG or SHORT
+    qty: Mapped[float] = mapped_column(Float, default=0.0)  # base asset quantity (BTC/ETH)
+    notional_usd: Mapped[float] = mapped_column(Float, default=0.0)  # USD value at entry
+    entry_price: Mapped[float] = mapped_column(Float)
+    stop_loss: Mapped[float] = mapped_column(Float)
+    take_profit: Mapped[float] = mapped_column(Float)
+    current_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pnl_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    pnl_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(20), default="OPEN", index=True)
+    # Strategy metadata
+    htf_bias: Mapped[str] = mapped_column(String(10), default="")  # up, down, mixed
+    setup_type: Mapped[str] = mapped_column(String(30), default="")  # liquidity_sweep_bos
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    rr_target: Mapped[float] = mapped_column(Float, default=2.0)
+    reasoning: Mapped[str] = mapped_column(Text, default="")
+    # Live order tracking
+    entry_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    exit_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mode: Mapped[str] = mapped_column(String(20), default="paper", index=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CandleWallet(Base):
+    """Simulated paper wallet + cached live Binance balance for candle bot."""
+    __tablename__ = "candle_wallet"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    # Paper-mode simulated balance
+    paper_balance: Mapped[float] = mapped_column(Float, default=1000.00)
+    paper_starting_balance: Mapped[float] = mapped_column(Float, default=1000.00)
+    # Live-mode cached balance (refreshed from Binance API on each tick)
+    live_balance_usdt: Mapped[float] = mapped_column(Float, default=0.00)
+    live_balance_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Aggregate stats — paper
+    paper_total_pnl: Mapped[float] = mapped_column(Float, default=0.00)
+    paper_total_trades: Mapped[int] = mapped_column(Integer, default=0)
+    paper_wins: Mapped[int] = mapped_column(Integer, default=0)
+    paper_losses: Mapped[int] = mapped_column(Integer, default=0)
+    # Aggregate stats — live
+    live_total_pnl: Mapped[float] = mapped_column(Float, default=0.00)
+    live_total_trades: Mapped[int] = mapped_column(Integer, default=0)
+    live_wins: Mapped[int] = mapped_column(Integer, default=0)
+    live_losses: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)

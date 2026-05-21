@@ -7,7 +7,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.models import PolyTrade, Trade
+from app.models.models import CandleTrade, PolyTrade, Trade
 
 
 def _start_of_day_utc() -> datetime:
@@ -100,3 +100,52 @@ async def check_polymarket_canary(
         "open_exposure_usd": round(open_exposure, 4),
     }
 
+
+async def check_candle_canary(
+    session: AsyncSession,
+    *,
+    mode: str,
+    order_usd: float,
+) -> tuple[bool, str, dict]:
+    """Live Binance Spot canary limits for the candle bot."""
+    if not settings.LIVE_CANARY_ENABLED or mode != "live_armed":
+        return True, "ok", {"canary_applied": False}
+    if order_usd > settings.CANDLE_CANARY_MAX_ORDER_USD:
+        return False, "canary_order_size_limit", {"order_usd": order_usd}
+
+    start = _start_of_day_utc()
+    opened_today = int(
+        (
+            await session.execute(
+                select(func.count(CandleTrade.id)).where(
+                    CandleTrade.mode == "live",
+                    CandleTrade.opened_at >= start,
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+    if opened_today >= settings.CANDLE_CANARY_MAX_NEW_TRADES_PER_DAY:
+        return False, "canary_daily_new_trade_limit", {"opened_today": opened_today}
+
+    open_exposure = float(
+        (
+            await session.execute(
+                select(func.coalesce(func.sum(CandleTrade.notional_usd), 0.0)).where(
+                    CandleTrade.mode == "live",
+                    CandleTrade.status == "OPEN",
+                )
+            )
+        ).scalar_one()
+        or 0.0
+    )
+    if open_exposure + order_usd > settings.CANDLE_CANARY_MAX_TOTAL_EXPOSURE_USD:
+        return False, "canary_total_exposure_limit", {
+            "open_exposure_usd": round(open_exposure, 4),
+            "order_usd": order_usd,
+        }
+    return True, "ok", {
+        "canary_applied": True,
+        "opened_today": opened_today,
+        "open_exposure_usd": round(open_exposure, 4),
+    }

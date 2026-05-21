@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.core.db import SessionLocal
 from app.models.models import BotLog, CandleTrade, CandleWallet
 from app.services import binance_data, binance_live, candle_strategy
+from app.services.canary_guard import check_candle_canary
 from app.services.events import bus
 from app.services.mode_guard import mode_guard
 
@@ -246,6 +247,8 @@ class CandleBot:
             equity = (
                 wallet.live_balance_usdt if self.is_live else wallet.paper_balance
             )
+        if self.is_live and live_balance is not None:
+            equity = min(equity, live_balance)
         if equity <= 0:
             await self._log("INFO", f"skip {symbol}: zero equity ({equity})")
             return False
@@ -296,6 +299,15 @@ class CandleBot:
                 return False
             if notional_usd > equity:
                 await self._log("INFO", f"skip {symbol}: rounded notional ${notional_usd:.2f} > equity ${equity:.2f}")
+                return False
+            async with SessionLocal() as s:
+                allowed, reason, meta = await check_candle_canary(
+                    s,
+                    mode=mode_guard.get("candle").mode,
+                    order_usd=notional_usd,
+                )
+            if not allowed:
+                await self._log("WARNING", f"skip {symbol}: {reason}", **meta)
                 return False
 
         # Place order (or simulate).
