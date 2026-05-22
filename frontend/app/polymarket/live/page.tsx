@@ -409,6 +409,10 @@ export default function PolymarketLivePage() {
     });
     return items.slice(0, 6);
   }, [logs]);
+  const geoBlockedItem = useMemo(
+    () => errorItems.find((e) => e.key === "geo_blocked") ?? null,
+    [errorItems]
+  );
 
   return (
     <div style={{ minHeight: "100vh", background: "#10131a", color: "#e0e2ec" }}>
@@ -435,6 +439,30 @@ export default function PolymarketLivePage() {
             <button className="btn btn-stop" disabled={busy} onClick={killToggle}>{mode?.kill_switch ? "Disable Kill" : "Enable Kill"}</button>
           </div>
         </div>
+        {geoBlockedItem && (
+          <div
+            className="card"
+            style={{
+              marginBottom: 10,
+              border: "1px solid #6b2c35",
+              background: "linear-gradient(180deg, rgba(255,107,129,0.18), rgba(22,14,18,0.88))",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+              <div>
+                <div style={{ fontWeight: 800, color: "#ff9cab" }}>
+                  LIVE TRADING BLOCKED: GEO ISSUE DETECTED
+                </div>
+                <div style={{ fontSize: 12, color: "#ffd5dc", marginTop: 4 }}>
+                  Orders are failing due to geo restrictions. Count: {geoBlockedItem.count} · Last seen: {geoBlockedItem.lastSeen}
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: "#9fd0ff" }}>
+                Fix: {geoBlockedItem.action}
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="operator-kpis" style={{ display: "grid", gridTemplateColumns: "repeat(12, minmax(0, 1fr))", gap: 8, overflowX: "hidden", paddingBottom: 0 }}>
           <div className="operator-kpi"><span>MODE</span><strong>{modeLabel}</strong></div>
